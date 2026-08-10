@@ -1,0 +1,339 @@
+const params = new URLSearchParams(window.location.search);
+const ctx = {
+  documentId: params.get("documentId"),
+  workspaceId: params.get("workspaceId"),
+  elementId: params.get("elementId"),
+};
+
+const partSelect = document.getElementById("partSelect");
+const stageBtn = document.getElementById("stageBtn");
+const treePane = document.getElementById("treePane");
+const stagePane = document.getElementById("stagePane");
+const staticCheck = document.getElementById("staticCheck");
+const uploadBtn = document.getElementById("uploadBtn");
+const statusEl = document.getElementById("status");
+const undoBtn = document.getElementById("undoBtn");
+const redoBtn = document.getElementById("redoBtn");
+
+// ---------- state ----------
+// staged items the user built up before hitting Upload
+let staged = [];         // [{ id, partId, partName, name, replaceTarget, archiveMode }]
+let pendingDeletes = []; // [path] - trash-icon deletes on existing tree files
+let treeEntries = [];    // raw entries from /api/tree
+
+let history = [];  // undo/redo stack of {staged, pendingDeletes} snapshots
+let historyIndex = -1;
+
+function snapshot() {
+  history = history.slice(0, historyIndex + 1);
+  history.push({ staged: JSON.parse(JSON.stringify(staged)), pendingDeletes: [...pendingDeletes] });
+  historyIndex++;
+}
+function undo() {
+  if (historyIndex <= 0) return;
+  historyIndex--;
+  restore(history[historyIndex]);
+}
+function redo() {
+  if (historyIndex >= history.length - 1) return;
+  historyIndex++;
+  restore(history[historyIndex]);
+}
+function restore(snap) {
+  staged = JSON.parse(JSON.stringify(snap.staged));
+  pendingDeletes = [...snap.pendingDeletes];
+  renderStage();
+  renderTree();
+}
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); }
+});
+undoBtn.addEventListener("click", undo);
+redoBtn.addEventListener("click", redo);
+
+// ---------- load parts + tree ----------
+
+async function loadParts() {
+  const res = await fetch(`/api/parts?${params.toString()}`);
+  const { parts } = await res.json();
+  partSelect.innerHTML = parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
+}
+
+async function loadTree() {
+  const res = await fetch("/api/tree");
+  const { entries } = await res.json();
+  treeEntries = entries;
+  renderTree();
+}
+
+stageBtn.addEventListener("click", () => {
+  const selected = Array.from(partSelect.selectedOptions);
+  if (!selected.length) return;
+  for (const opt of selected) {
+    staged.push({
+      id: crypto.randomUUID(),
+      partId: opt.value,
+      partName: opt.textContent,
+      name: opt.textContent,       // editable filename, defaults to part name
+      replaceTarget: null,
+      archiveMode: "archive",
+    });
+  }
+  snapshot();
+  renderStage();
+});
+
+// ---------- tree rendering (nested by path) ----------
+
+function buildNestedTree(entries) {
+  const root = {};
+  for (const e of entries) {
+    if (e.path.endsWith("/.gitkeep")) continue; // hide placeholder files
+    const parts = e.path.split("/");
+    let node = root;
+    parts.forEach((part, i) => {
+      const isLast = i === parts.length - 1;
+      if (!node[part]) node[part] = { __children: {}, __isFile: isLast && e.type === "file", __path: parts.slice(0, i + 1).join("/") };
+      node = node[part].__children;
+    });
+  }
+  return root;
+}
+
+function renderTree() {
+  const nested = buildNestedTree(treeEntries);
+  treePane.innerHTML = `
+    <div class="tree-header">
+      <span style="opacity:0.5; font-size:10px;">repo root</span>
+      <span class="icon-btn" id="newFolderBtn" title="New folder">＋</span>
+    </div>
+    <div id="treeRoot"></div>
+  `;
+  document.getElementById("treeRoot").appendChild(renderNode(nested, 0));
+  document.getElementById("newFolderBtn").addEventListener("click", () => createFolder(""));
+}
+
+function renderNode(node, depth) {
+  const wrap = document.createElement("div");
+  for (const key of Object.keys(node).sort()) {
+    const entry = node[key];
+    const isFile = entry.__isFile;
+    const row = document.createElement("div");
+    row.className = "tree-node";
+    row.innerHTML = `<div class="tree-line"></div>`;
+
+    const inner = document.createElement("div");
+    inner.className = "row" + (isFile ? "" : " folder");
+    inner.dataset.path = entry.__path;
+    inner.innerHTML = `
+      <span class="row-label">${isFile ? "📄" : "📁"} ${key}</span>
+      <span class="row-actions">
+        <span class="rename-icon" title="Rename">✎</span>
+        ${isFile ? '<span class="delete-icon" title="Delete">🗑</span>' : ""}
+      </span>
+    `;
+
+    inner.querySelector(".rename-icon").addEventListener("click", (e) => {
+      e.stopPropagation();
+      renamePath(entry.__path, isFile);
+    });
+    const delIcon = inner.querySelector(".delete-icon");
+    if (delIcon) {
+      delIcon.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleDelete(entry.__path, inner);
+      });
+    }
+
+    if (isFile) {
+      inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
+      inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
+      inner.addEventListener("drop", (e) => {
+        e.preventDefault();
+        inner.classList.remove("dragover");
+        const stagedId = e.dataTransfer.getData("text/plain");
+        assignReplacement(stagedId, entry.__path, inner);
+      });
+    } else {
+      // dropping onto a folder = add as new file there, no replacement
+      inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
+      inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
+      inner.addEventListener("drop", (e) => {
+        e.preventDefault();
+        inner.classList.remove("dragover");
+        const stagedId = e.dataTransfer.getData("text/plain");
+        assignDestination(stagedId, entry.__path);
+      });
+    }
+
+    row.appendChild(inner);
+    if (Object.keys(entry.__children).length) {
+      const childWrap = document.createElement("div");
+      childWrap.style.marginLeft = "10px";
+      childWrap.appendChild(renderNode(entry.__children, depth + 1));
+      row.appendChild(childWrap);
+    }
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function toggleDelete(path, rowEl) {
+  const idx = pendingDeletes.indexOf(path);
+  if (idx === -1) {
+    pendingDeletes.push(path);
+    rowEl.style.background = "#5c1e1e";
+  } else {
+    pendingDeletes.splice(idx, 1);
+    rowEl.style.background = "";
+  }
+  snapshot();
+}
+
+async function createFolder(parentPath) {
+  const name = prompt("New folder name:");
+  if (!name) return;
+  const folderPath = parentPath ? `${parentPath}/${name}` : name;
+  await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folderPath }) });
+  await loadTree();
+}
+
+async function renamePath(oldPath, isFile) {
+  const currentName = oldPath.split("/").pop();
+  const newName = prompt("Rename to:", currentName);
+  if (!newName || newName === currentName) return;
+  const parent = oldPath.substring(0, oldPath.lastIndexOf("/"));
+  const newPath = parent ? `${parent}/${newName}` : newName;
+  await fetch("/api/rename", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ oldPath, newPath, isFolder: !isFile }) });
+  await loadTree();
+}
+
+// ---------- staging pane ----------
+
+function renderStage() {
+  if (!staged.length) {
+    stagePane.innerHTML = `<div style="opacity:0.5; font-size:11px;">Stage parts above</div>`;
+    return;
+  }
+  stagePane.innerHTML = "";
+  for (const item of staged) {
+    const card = document.createElement("div");
+    card.className = "stage-card";
+    card.draggable = true;
+    card.dataset.id = item.id;
+    card.innerHTML = `
+      <span class="row-label">📄 ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
+      <span class="row-actions">
+        <span class="rename-icon" title="Rename">✎</span>
+        <span class="unstage-icon" title="Remove" style="color:#e5534b;">✕</span>
+      </span>
+    `;
+    card.addEventListener("dragstart", (e) => {
+      card.classList.add("dragging");
+      e.dataTransfer.setData("text/plain", item.id);
+    });
+    card.addEventListener("dragend", () => card.classList.remove("dragging"));
+
+    card.querySelector(".rename-icon").addEventListener("click", () => {
+      const newName = prompt("File name:", item.name);
+      if (newName) { item.name = newName; snapshot(); renderStage(); }
+    });
+    card.querySelector(".unstage-icon").addEventListener("click", () => {
+      staged = staged.filter((s) => s.id !== item.id);
+      snapshot();
+      renderStage();
+    });
+
+    stagePane.appendChild(card);
+  }
+}
+
+function assignReplacement(stagedId, targetPath, rowEl) {
+  const item = staged.find((s) => s.id === stagedId);
+  if (!item) return;
+  item.replaceTarget = targetPath;
+  item.destinationPath = null;
+  // little "flies off" cue on the tree row to signal it'll be archived on commit
+  rowEl.classList.add("flying-away");
+  setTimeout(() => rowEl.classList.remove("flying-away"), 350);
+  snapshot();
+  renderStage();
+}
+
+function assignDestination(stagedId, folderPath) {
+  const item = staged.find((s) => s.id === stagedId);
+  if (!item) return;
+  item.replaceTarget = null;
+  item.destinationPath = folderPath;
+  snapshot();
+  renderStage();
+}
+
+// unstaging by deselecting in the part list too
+partSelect.addEventListener("change", () => {
+  const selectedIds = new Set(Array.from(partSelect.selectedOptions).map((o) => o.value));
+  staged = staged.filter((s) => selectedIds.has(s.partId) || s.__manuallyKept);
+});
+
+// ---------- commit ----------
+
+uploadBtn.addEventListener("click", async () => {
+  if (!staged.length && !pendingDeletes.length) {
+    setStatus("Nothing staged.");
+    return;
+  }
+  for (const item of staged) {
+    if (!item.replaceTarget && !item.destinationPath) {
+      setStatus(`"${item.name}" needs a destination — drag it onto a folder or file in the tree.`);
+      return;
+    }
+  }
+
+  uploadBtn.disabled = true;
+  setStatus("Uploading…");
+
+  const items = staticCheck.checked
+    ? [{
+        partIds: staged.map((s) => s.partId),
+        isStatic: true,
+        name: staged[0]?.name || "Static Export",
+        replaceTarget: staged.find((s) => s.replaceTarget)?.replaceTarget || null,
+        destinationPath: staged.find((s) => s.destinationPath)?.destinationPath || null,
+        archiveMode: staged[0]?.archiveMode || "archive",
+      }]
+    : staged.map((s) => ({
+        partIds: [s.partId],
+        isStatic: false,
+        name: s.name,
+        replaceTarget: s.replaceTarget,
+        destinationPath: s.destinationPath,
+        archiveMode: s.archiveMode,
+      }));
+
+  try {
+    const res = await fetch("/api/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...ctx, deletes: pendingDeletes, items }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Commit failed");
+    setStatus("Done:\n" + data.results.map((r) => `${r.path} — ${r.action}`).join("\n"));
+    staged = [];
+    pendingDeletes = [];
+    history = []; historyIndex = -1;
+    renderStage();
+    await loadTree();
+  } catch (err) {
+    setStatus("Error: " + err.message);
+  } finally {
+    uploadBtn.disabled = false;
+  }
+});
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+loadParts();
+loadTree();
+snapshot();

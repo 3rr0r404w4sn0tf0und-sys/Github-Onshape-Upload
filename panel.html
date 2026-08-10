@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>CAD → GitHub</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, sans-serif; font-size:12px; background:#1e1f22; color:#eee; margin:0; padding:10px; }
+  h4 { margin: 10px 0 6px; font-size:10px; text-transform:uppercase; opacity:0.55; letter-spacing:0.05em; }
+  button { cursor:pointer; font-family:inherit; }
+
+  /* ---- login view ---- */
+  #loginView { display:flex; flex-direction:column; align-items:center; justify-content:center; height:80vh; gap:14px; text-align:center; }
+  #loginView button { background:#24292f; color:white; border:1px solid #444; padding:10px 16px; border-radius:6px; font-size:12px; }
+
+  /* ---- repo picker view ---- */
+  #repoPickerView { display:none; }
+  .repo-row { display:flex; justify-content:space-between; align-items:center; padding:6px 8px; border-radius:5px; background:#2b2d31; margin-bottom:5px; font-size:11px; }
+  .repo-row button { background:#2ea043; color:white; border:none; border-radius:4px; padding:4px 8px; font-size:10px; }
+  .repo-row button.secondary { background:#3a3b3e; }
+  #repoSearch { width:100%; padding:6px; margin-bottom:8px; background:#2b2d31; color:#eee; border:1px solid #444; border-radius:4px; }
+
+  /* ---- main tool view (unchanged from before) ---- */
+  #mainView { display:none; }
+  #topBar { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:11px; opacity:0.8; }
+  #topBar button { background:none; border:none; color:#8ab4f8; text-decoration:underline; font-size:11px; padding:0; }
+
+  #treePane, #stagePane { background:#26282c; border-radius:6px; border:1px solid #3a3b3e; padding:8px; overflow-y:auto; }
+  #treePane { height: 36vh; }
+  #stagePane { height: 20vh; margin-top:8px; }
+
+  .tree-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .icon-btn { width:20px; height:20px; border-radius:4px; border:1px solid #444; background:#2b2d31; color:#aaa; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:12px; }
+  .icon-btn:hover { background:#3a3b3e; }
+
+  .tree-node { padding-left:14px; position:relative; font-family: ui-monospace, monospace; font-size:11px; }
+  .tree-line { position:absolute; left:5px; top:0; bottom:0; width:1px; background:#444; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:2px 4px; border-radius:4px; }
+  .row.folder { font-weight:600; }
+  .row.dragover { background:#5865F2 !important; }
+  .row.flying-away { transform: translateX(30px) scale(0.85); opacity:0; transition: all 0.35s ease; }
+  .row-label { display:flex; align-items:center; gap:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row-actions { display:flex; gap:8px; flex-shrink:0; opacity:0.6; }
+  .row-actions span { cursor:pointer; }
+  .row-actions span:hover { opacity:1; }
+
+  .stage-card { background:#2b2d31; border:1px solid #444; border-radius:5px; padding:6px 8px; margin-bottom:6px; cursor:grab; display:flex; align-items:center; justify-content:space-between; }
+  .stage-card.dragging { opacity:0.35; }
+  .stage-card .row-label { font-size:11px; }
+  .stage-card .row-actions { gap:10px; }
+
+  #settingsPane { background:#26282c; border-radius:6px; border:1px solid #3a3b3e; padding:8px; margin-top:8px; }
+  .settings-top { display:flex; justify-content:space-between; align-items:center; }
+  label.check { display:flex; align-items:center; gap:5px; font-size:11px; color:#ccc; }
+
+  #uploadBtn { width:100%; margin-top:10px; padding:9px; background:#2ea043; color:white; border:none; border-radius:5px; font-weight:600; cursor:pointer; font-size:12px; }
+  #uploadBtn:disabled { opacity:0.5; cursor:not-allowed; }
+  #status { margin-top:8px; font-size:11px; opacity:0.8; white-space:pre-wrap; }
+
+  #partSelectWrap { margin-bottom:8px; }
+  select { width:100%; padding:5px; background:#2b2d31; color:#eee; border:1px solid #444; border-radius:4px; font-size:11px; }
+</style>
+</head>
+<body>
+
+<div id="loginView">
+  <div style="font-size:13px; opacity:0.8;">Connect both accounts to get started</div>
+  <button id="githubLoginBtn">Sign in with GitHub</button>
+  <button id="onshapeLoginBtn">Sign in with Onshape</button>
+  <div id="onshapeStatus" style="font-size:10px; opacity:0.6;"></div>
+</div>
+
+<div id="repoPickerView">
+  <div id="topBar" style="display:none;"></div>
+  <h4>Choose a repo to work with</h4>
+  <input id="repoSearch" placeholder="Search your repos…" />
+  <div id="repoList"></div>
+</div>
+
+<div id="mainView">
+  <div id="topBar"></div>
+
+  <div id="partSelectWrap">
+    <label style="font-size:10px; opacity:0.6;">Parts in current tab</label>
+    <select id="partSelect" multiple size="4"></select>
+    <button class="icon-btn" id="stageBtn" style="width:100%; margin-top:4px;">Stage selected parts →</button>
+  </div>
+
+  <h4>File tree (drag a staged file onto one to replace it)</h4>
+  <div id="treePane"><div style="opacity:0.5;">Loading…</div></div>
+
+  <h4>Staged for upload</h4>
+  <div id="stagePane"><div style="opacity:0.5; font-size:11px;">Stage parts above</div></div>
+
+  <div id="settingsPane">
+    <div class="settings-top">
+      <label class="check"><input type="checkbox" id="staticCheck" /> Static (merge staged into one file)</label>
+      <span style="display:flex; gap:8px; opacity:0.6;">
+        <span class="icon-btn" id="undoBtn" title="Undo">↶</span>
+        <span class="icon-btn" id="redoBtn" title="Redo">↷</span>
+      </span>
+    </div>
+  </div>
+
+  <button id="uploadBtn">Upload to GitHub</button>
+  <div id="status"></div>
+</div>
+
+<script src="panel.js"></script>
+</body>
+</html>

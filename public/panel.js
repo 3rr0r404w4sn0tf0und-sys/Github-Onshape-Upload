@@ -210,7 +210,9 @@ stageBtn.addEventListener("click", () => {
       id: crypto.randomUUID(),
       occurrenceId: opt.value,
       partId: info.partId,
-      sourceElementId: info.sourceElementId, // which Part Studio tab this part actually lives in
+      sourceDocumentId: info.sourceDocumentId,   // which document this part actually lives in
+      sourceElementId: info.sourceElementId,     // which Part Studio tab within that document
+      sourceMicroversion: info.sourceMicroversion, // exact snapshot the assembly references
       partName: opt.textContent,
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
@@ -450,9 +452,16 @@ uploadBtn.addEventListener("click", async () => {
 
   const formatName = formatSelect.value;
 
+  const partRef = (s) => ({
+    sourceDocumentId: s.sourceDocumentId,
+    sourceElementId: s.sourceElementId,
+    sourceMicroversion: s.sourceMicroversion,
+    partId: s.partId,
+  });
+
   const items = staticCheck.checked
     ? [{
-        parts: staged.map((s) => ({ sourceElementId: s.sourceElementId, partId: s.partId })),
+        parts: staged.map(partRef),
         isStatic: true,
         name: staged[0]?.name || "Static Export",
         replaceTarget: staged.find((s) => s.replaceTarget)?.replaceTarget || null,
@@ -461,7 +470,7 @@ uploadBtn.addEventListener("click", async () => {
         formatName,
       }]
     : staged.map((s) => ({
-        parts: [{ sourceElementId: s.sourceElementId, partId: s.partId }],
+        parts: [partRef(s)],
         isStatic: false,
         name: s.name,
         replaceTarget: s.replaceTarget,
@@ -474,7 +483,7 @@ uploadBtn.addEventListener("click", async () => {
     const res = await fetch("/api/commit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ documentId: ctx.documentId, workspaceId: ctx.workspaceId, deletes: pendingDeletes, items }),
+      body: JSON.stringify({ deletes: pendingDeletes, items }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Commit failed");

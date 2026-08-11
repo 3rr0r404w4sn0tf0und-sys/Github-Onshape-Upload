@@ -139,6 +139,7 @@ const stageBtn = document.getElementById("stageBtn");
 const treePane = document.getElementById("treePane");
 const stagePane = document.getElementById("stagePane");
 const staticCheck = document.getElementById("staticCheck");
+const formatSelect = document.getElementById("formatSelect");
 const uploadBtn = document.getElementById("uploadBtn");
 const statusEl = document.getElementById("status");
 const undoBtn = document.getElementById("undoBtn");
@@ -183,9 +184,13 @@ redoBtn.addEventListener("click", redo);
 
 // ---------- load parts + tree ----------
 
+let partsById = {}; // occurrence id -> full part info (name, partId, sourceElementId)
+
 async function loadParts() {
   const res = await fetch(`/api/parts?${params.toString()}`);
   const { parts } = await res.json();
+  partsById = {};
+  parts.forEach((p) => { partsById[p.id] = p; });
   partSelect.innerHTML = parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
 }
 
@@ -200,9 +205,12 @@ stageBtn.addEventListener("click", () => {
   const selected = Array.from(partSelect.selectedOptions);
   if (!selected.length) return;
   for (const opt of selected) {
+    const info = partsById[opt.value];
     staged.push({
       id: crypto.randomUUID(),
-      partId: opt.value,
+      occurrenceId: opt.value,
+      partId: info.partId,
+      sourceElementId: info.sourceElementId, // which Part Studio tab this part actually lives in
       partName: opt.textContent,
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
@@ -340,6 +348,8 @@ async function renamePath(oldPath, isFile) {
 
 // ---------- staging pane ----------
 
+let editingId = null; // which staged card is currently in inline-rename mode
+
 function renderStage() {
   if (!staged.length) {
     stagePane.innerHTML = `<div style="opacity:0.5; font-size:11px;">Stage parts above</div>`;
@@ -348,31 +358,47 @@ function renderStage() {
   stagePane.innerHTML = "";
   for (const item of staged) {
     const card = document.createElement("div");
-    card.className = "stage-card";
-    card.draggable = true;
+    card.className = "stage-card" + (editingId && editingId !== item.id ? " dimmed" : "");
+    card.draggable = editingId === null; // don't allow dragging mid-rename
     card.dataset.id = item.id;
-    card.innerHTML = `
-      <span class="row-label">📄 ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
-      <span class="row-actions">
-        <span class="rename-icon" title="Rename">✎</span>
-        <span class="unstage-icon" title="Remove" style="color:#e5534b;">✕</span>
-      </span>
-    `;
-    card.addEventListener("dragstart", (e) => {
-      card.classList.add("dragging");
-      e.dataTransfer.setData("text/plain", item.id);
-    });
-    card.addEventListener("dragend", () => card.classList.remove("dragging"));
 
-    card.querySelector(".rename-icon").addEventListener("click", () => {
-      const newName = prompt("File name:", item.name);
-      if (newName) { item.name = newName; snapshot(); renderStage(); }
-    });
-    card.querySelector(".unstage-icon").addEventListener("click", () => {
-      staged = staged.filter((s) => s.id !== item.id);
-      snapshot();
-      renderStage();
-    });
+    if (editingId === item.id) {
+      card.innerHTML = `<input type="text" class="rename-input" value="${item.name}" />`;
+      const input = card.querySelector("input");
+      const commit = () => {
+        if (input.value.trim()) item.name = input.value.trim();
+        editingId = null;
+        snapshot();
+        renderStage();
+      };
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") { editingId = null; renderStage(); } });
+      input.addEventListener("blur", commit);
+      // defer focus so it happens after the input is actually in the DOM
+      setTimeout(() => { input.focus(); input.select(); }, 0);
+    } else {
+      card.innerHTML = `
+        <span class="row-label">📄 ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
+        <span class="row-actions">
+          <span class="rename-icon" title="Rename">✎</span>
+          <span class="unstage-icon" title="Remove" style="color:#e5534b;">✕</span>
+        </span>
+      `;
+      card.addEventListener("dragstart", (e) => {
+        card.classList.add("dragging");
+        e.dataTransfer.setData("text/plain", item.id);
+      });
+      card.addEventListener("dragend", () => card.classList.remove("dragging"));
+
+      card.querySelector(".rename-icon").addEventListener("click", () => {
+        editingId = item.id; // dims every other card until this one is committed
+        renderStage();
+      });
+      card.querySelector(".unstage-icon").addEventListener("click", () => {
+        staged = staged.filter((s) => s.id !== item.id);
+        snapshot();
+        renderStage();
+      });
+    }
 
     stagePane.appendChild(card);
   }
@@ -422,29 +448,33 @@ uploadBtn.addEventListener("click", async () => {
   uploadBtn.disabled = true;
   setStatus("Uploading…");
 
+  const formatName = formatSelect.value;
+
   const items = staticCheck.checked
     ? [{
-        partIds: staged.map((s) => s.partId),
+        parts: staged.map((s) => ({ sourceElementId: s.sourceElementId, partId: s.partId })),
         isStatic: true,
         name: staged[0]?.name || "Static Export",
         replaceTarget: staged.find((s) => s.replaceTarget)?.replaceTarget || null,
         destinationPath: staged.find((s) => s.destinationPath)?.destinationPath || null,
         archiveMode: staged[0]?.archiveMode || "archive",
+        formatName,
       }]
     : staged.map((s) => ({
-        partIds: [s.partId],
+        parts: [{ sourceElementId: s.sourceElementId, partId: s.partId }],
         isStatic: false,
         name: s.name,
         replaceTarget: s.replaceTarget,
         destinationPath: s.destinationPath,
         archiveMode: s.archiveMode,
+        formatName,
       }));
 
   try {
     const res = await fetch("/api/commit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...ctx, deletes: pendingDeletes, items }),
+      body: JSON.stringify({ documentId: ctx.documentId, workspaceId: ctx.workspaceId, deletes: pendingDeletes, items }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Commit failed");

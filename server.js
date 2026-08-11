@@ -15,6 +15,8 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.set("trust proxy", 1); // Render sits behind a proxy - needed for secure cookies to work
 
+app.get("/", (req, res) => res.redirect("/panel.html"));
+
 app.use(session({
   secret: process.env.SESSION_SECRET,
   resave: false,
@@ -111,6 +113,17 @@ app.get("/auth/onshape/callback", async (req, res) => {
 
 app.post("/api/logout", (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
+});
+
+app.post("/api/logout-github", (req, res) => {
+  // Clears GitHub auth + repo selection only - Onshape session stays intact,
+  // so switching GitHub accounts doesn't force re-authorizing Onshape too.
+  delete req.session.accessToken;
+  delete req.session.username;
+  delete req.session.avatarUrl;
+  delete req.session.defaultRepo;
+  delete req.session.activeRepo;
+  res.json({ success: true });
 });
 
 app.get("/api/me", (req, res) => {

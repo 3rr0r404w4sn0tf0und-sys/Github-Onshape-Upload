@@ -118,9 +118,19 @@ function setupTopBar() {
   const bar = document.querySelectorAll("#topBar")[1]; // the one inside mainView
   bar.innerHTML = `
     <span>${activeRepoInfo ? activeRepoInfo.fullName : ""} — signed in as ${me.username}</span>
-    <button id="switchRepoBtn">Switch repo</button>
+    <span style="display:flex; gap:10px;">
+      <button id="switchRepoBtn">Switch repo</button>
+      <button id="signOutBtn">Sign out</button>
+    </span>
   `;
   document.getElementById("switchRepoBtn").addEventListener("click", () => openRepoPicker(true));
+  document.getElementById("signOutBtn").addEventListener("click", async () => {
+    await fetch("/api/logout-github", { method: "POST" });
+    me = null;
+    activeRepoInfo = null;
+    mainViewInitialized = false; // allow re-binding tool listeners on next sign-in
+    checkAuth();
+  });
 }
 
 // ---------------- main tool logic (only runs once a repo is active) ----------------

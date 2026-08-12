@@ -1,7 +1,8 @@
 const params = new URLSearchParams(window.location.search);
 const ctx = {
   documentId: params.get("documentId"),
-  workspaceId: params.get("workspaceId"),
+  workspaceOrVersion: params.get("workspaceOrVersion"), // "w" or "v"
+  workspaceOrVersionId: params.get("workspaceOrVersionId"),
   elementId: params.get("elementId"),
 };
 
@@ -220,6 +221,11 @@ async function loadTree() {
   const res = await fetch("/api/tree");
   const { entries } = await res.json();
   treeEntries = entries;
+  if (!treeLoadedOnce) {
+    // Default every folder to collapsed the first time the tree loads
+    entries.filter((e) => e.type === "folder").forEach((e) => collapsedPaths.add(e.path));
+    treeLoadedOnce = true;
+  }
   renderTree();
 }
 
@@ -278,6 +284,7 @@ function renderTree() {
 const FOLDER_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 3.5h4l1.5 2h7v7h-12.5z"/></svg>`;
 const FILE_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></svg>`;
 const collapsedPaths = new Set();
+let treeLoadedOnce = false;
 
 function renderNode(node, depth) {
   const wrap = document.createElement("div");

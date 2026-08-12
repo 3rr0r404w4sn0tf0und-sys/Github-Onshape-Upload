@@ -15,7 +15,10 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.set("trust proxy", 1); // Render sits behind a proxy - needed for secure cookies to work
 
-app.get("/", (req, res) => res.redirect("/panel.html"));
+app.get("/", (req, res) => {
+  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
+  res.redirect("/panel.html" + qs);
+});
 
 app.use(session({
   secret: process.env.SESSION_SECRET,

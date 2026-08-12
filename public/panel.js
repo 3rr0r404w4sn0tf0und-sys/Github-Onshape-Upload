@@ -150,6 +150,7 @@ const treePane = document.getElementById("treePane");
 const stagePane = document.getElementById("stagePane");
 const staticCheck = document.getElementById("staticCheck");
 const formatSelect = document.getElementById("formatSelect");
+let partsById = {}; // occurrence id -> full part info (name, partId, sourceElementId)
 const uploadBtn = document.getElementById("uploadBtn");
 const statusEl = document.getElementById("status");
 const undoBtn = document.getElementById("undoBtn");
@@ -194,14 +195,25 @@ redoBtn.addEventListener("click", redo);
 
 // ---------- load parts + tree ----------
 
-let partsById = {}; // occurrence id -> full part info (name, partId, sourceElementId)
-
 async function loadParts() {
-  const res = await fetch(`/api/parts?${params.toString()}`);
-  const { parts } = await res.json();
-  partsById = {};
-  parts.forEach((p) => { partsById[p.id] = p; });
-  partSelect.innerHTML = parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
+  partSelect.innerHTML = `<option disabled>Loading…</option>`;
+  try {
+    const res = await fetch(`/api/parts?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) {
+      partSelect.innerHTML = `<option disabled>Error: ${data.error || "failed to load parts"}</option>`;
+      return;
+    }
+    partsById = {};
+    data.parts.forEach((p) => { partsById[p.id] = p; });
+    if (!data.parts.length) {
+      partSelect.innerHTML = `<option disabled>No parts found - is this an Assembly tab?</option>`;
+      return;
+    }
+    partSelect.innerHTML = data.parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
+  } catch (err) {
+    partSelect.innerHTML = `<option disabled>Error: ${err.message}</option>`;
+  }
 }
 
 async function loadTree() {
@@ -263,11 +275,18 @@ function renderTree() {
   document.getElementById("newFolderBtn").addEventListener("click", () => createFolder(""));
 }
 
+const FOLDER_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 3.5h4l1.5 2h7v7h-12.5z"/></svg>`;
+const FILE_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></svg>`;
+const collapsedPaths = new Set();
+
 function renderNode(node, depth) {
   const wrap = document.createElement("div");
   for (const key of Object.keys(node).sort()) {
     const entry = node[key];
     const isFile = entry.__isFile;
+    const hasChildren = Object.keys(entry.__children).length > 0;
+    const isCollapsed = collapsedPaths.has(entry.__path);
+
     const row = document.createElement("div");
     row.className = "tree-node";
     row.innerHTML = `<div class="tree-line"></div>`;
@@ -276,12 +295,25 @@ function renderNode(node, depth) {
     inner.className = "row" + (isFile ? "" : " folder");
     inner.dataset.path = entry.__path;
     inner.innerHTML = `
-      <span class="row-label">${isFile ? "📄" : "📁"} ${key}</span>
+      <span class="row-label">
+        <span class="tree-toggle">${!isFile && hasChildren ? (isCollapsed ? "▸" : "▾") : ""}</span>
+        ${isFile ? FILE_SVG : FOLDER_SVG}
+        ${key}
+      </span>
       <span class="row-actions">
         <span class="rename-icon" title="Rename">✎</span>
         ${isFile ? '<span class="delete-icon" title="Delete">🗑</span>' : ""}
       </span>
     `;
+
+    if (!isFile && hasChildren) {
+      inner.querySelector(".tree-toggle").addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (collapsedPaths.has(entry.__path)) collapsedPaths.delete(entry.__path);
+        else collapsedPaths.add(entry.__path);
+        renderTree();
+      });
+    }
 
     inner.querySelector(".rename-icon").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -317,7 +349,7 @@ function renderNode(node, depth) {
     }
 
     row.appendChild(inner);
-    if (Object.keys(entry.__children).length) {
+    if (hasChildren && !isCollapsed) {
       const childWrap = document.createElement("div");
       childWrap.style.marginLeft = "10px";
       childWrap.appendChild(renderNode(entry.__children, depth + 1));
@@ -389,7 +421,7 @@ function renderStage() {
       setTimeout(() => { input.focus(); input.select(); }, 0);
     } else {
       card.innerHTML = `
-        <span class="row-label">📄 ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
+        <span class="row-label">${FILE_SVG} ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
         <span class="row-actions">
           <span class="rename-icon" title="Rename">✎</span>
           <span class="unstage-icon" title="Remove" style="color:#e5534b;">✕</span>

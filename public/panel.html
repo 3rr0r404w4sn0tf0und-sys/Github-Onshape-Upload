@@ -5,9 +5,20 @@
 <title>CAD → GitHub</title>
 <style>
   * { box-sizing: border-box; }
+  html { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.15) transparent; }
   body { font-family: -apple-system, sans-serif; font-size:12px; background:#1e1f22; color:#eee; margin:0; padding:10px; }
   h4 { margin: 10px 0 6px; font-size:10px; text-transform:uppercase; opacity:0.55; letter-spacing:0.05em; }
   button { cursor:pointer; font-family:inherit; }
+
+  /* ---- custom, auto-hiding, low-sensitivity scrollbars (dark mode) ---- */
+  ::-webkit-scrollbar { width:6px; height:6px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.10); border-radius:10px; transition: background .25s ease; }
+  ::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,0.35); }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.10) transparent; }
+  .scroll-thin::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.06); }
+  .scroll-thin.scrolling::-webkit-scrollbar-thumb,
+  .scroll-thin:hover::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.32); }
 
   /* ---- login view ---- */
   #loginView { display:flex; flex-direction:column; align-items:center; justify-content:center; height:80vh; gap:14px; text-align:center; }
@@ -19,6 +30,7 @@
   .repo-row button { background:#2ea043; color:white; border:none; border-radius:4px; padding:4px 8px; font-size:10px; }
   .repo-row button.secondary { background:#3a3b3e; }
   #repoSearch { width:100%; padding:6px; margin-bottom:8px; background:#2b2d31; color:#eee; border:1px solid #444; border-radius:4px; }
+  #repoList { max-height:60vh; overflow-y:auto; }
 
   /* ---- main tool view (unchanged from before) ---- */
   #mainView { display:none; }
@@ -38,19 +50,26 @@
 
   .tree-node { padding-left:14px; position:relative; font-family: ui-monospace, monospace; font-size:11px; }
   .tree-line { position:absolute; left:5px; top:0; bottom:0; width:1px; background:#444; }
-  .row { display:flex; align-items:center; justify-content:space-between; padding:2px 4px; border-radius:4px; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:2px 4px; border-radius:4px; cursor:grab; }
   .row.folder { font-weight:600; }
   .row.dragover { background:#5865F2 !important; }
   .row.flying-away { transform: translateX(30px) scale(0.85); opacity:0; transition: all 0.35s ease; }
+  .row.pending-new { color:#7ee787; }
+  .row.pending-new .tree-icon { color:#7ee787; }
+  .row.pending-delete { color:#e5534b; text-decoration:line-through; opacity:0.6; }
   .row-label { display:flex; align-items:center; gap:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .row-actions { display:flex; gap:8px; flex-shrink:0; opacity:0.6; }
   .row-actions span { cursor:pointer; }
   .row-actions span:hover { opacity:1; }
 
-  .stage-card { background:#2b2d31; border:1px solid #444; border-radius:5px; padding:6px 8px; margin-bottom:6px; cursor:grab; display:flex; align-items:center; justify-content:space-between; }
+  input.tree-inline-input { width:100%; padding:3px 5px; background:#1e1f22; color:#eee; border:1px solid #5865F2; border-radius:3px; font-size:11px; font-family: ui-monospace, monospace; }
+
+  .stage-card { background:#2b2d31; border:1px solid #444; border-radius:5px; padding:6px 8px; margin-bottom:6px; cursor:grab; display:flex; align-items:center; justify-content:space-between; border-top:2px solid transparent; border-bottom:2px solid transparent; }
   .stage-card.dragging { opacity:0.35; }
   .stage-card.dimmed { opacity:0.25; pointer-events:none; transition: opacity 0.2s; }
   .stage-card { transition: opacity 0.2s; }
+  .stage-card.drop-before { border-top-color:#5865F2; }
+  .stage-card.drop-after { border-bottom-color:#5865F2; }
   .stage-card input.rename-input { width:100%; padding:3px 5px; background:#1e1f22; color:#eee; border:1px solid #5865F2; border-radius:3px; font-size:11px; }
   .stage-card .row-label { font-size:11px; }
   .stage-card .row-actions { gap:10px; }
@@ -80,7 +99,7 @@
   <div id="topBar" style="display:none;"></div>
   <h4>Choose a repo to work with</h4>
   <input id="repoSearch" placeholder="Search your repos…" />
-  <div id="repoList"></div>
+  <div id="repoList" class="scroll-thin"></div>
 </div>
 
 <div id="mainView">
@@ -92,11 +111,11 @@
     <button class="icon-btn" id="stageBtn" style="width:100%; margin-top:4px;">Stage selected parts →</button>
   </div>
 
-  <h4>File tree (drag a staged file onto one to replace it)</h4>
-  <div id="treePane"><div style="opacity:0.5;">Loading…</div></div>
+  <h4>File tree (drag a staged file onto one to replace it, drag files/folders to reorganize)</h4>
+  <div id="treePane" class="scroll-thin"><div style="opacity:0.5;">Loading…</div></div>
 
-  <h4>Staged for upload</h4>
-  <div id="stagePane"><div style="opacity:0.5; font-size:11px;">Stage parts above</div></div>
+  <h4>Staged for upload (drag to reorder)</h4>
+  <div id="stagePane" class="scroll-thin"><div style="opacity:0.5; font-size:11px;">Stage parts above</div></div>
 
   <div id="settingsPane">
     <div class="settings-top">

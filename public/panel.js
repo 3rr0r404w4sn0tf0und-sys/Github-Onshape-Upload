@@ -18,6 +18,24 @@ const repoList = document.getElementById("repoList");
 let me = null;
 let allRepos = [];
 
+// ---------- custom scrollbar behavior: thin + auto-hides + reduced wheel sensitivity ----------
+function attachCustomScroll(el) {
+  if (!el || el.__customScrollAttached) return;
+  el.__customScrollAttached = true;
+  el.classList.add("scroll-thin");
+  let hideTimer;
+  el.addEventListener("scroll", () => {
+    el.classList.add("scrolling");
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => el.classList.remove("scrolling"), 600);
+  });
+  el.addEventListener("wheel", (e) => {
+    // lower scroll sensitivity - dampen the delta instead of the browser default jump
+    e.preventDefault();
+    el.scrollTop += e.deltaY * 0.45;
+  }, { passive: false });
+}
+
 async function checkAuth() {
   const res = await fetch("/api/me");
   me = await res.json();
@@ -67,7 +85,7 @@ let cameFromMainView = false;
 async function openRepoPicker(fromMain) {
   cameFromMainView = fromMain;
   show("repo");
-  const topBar = repoPickerView.querySelector("#topBar") || document.querySelectorAll("#topBar")[0];
+  attachCustomScroll(repoList);
   if (fromMain) {
     document.querySelectorAll("#topBar")[0].style.display = "flex";
     document.querySelectorAll("#topBar")[0].innerHTML = `<button id="backBtn">← Back</button><span></span>`;
@@ -83,7 +101,7 @@ async function openRepoPicker(fromMain) {
 function renderRepoList(repos) {
   repoList.innerHTML = repos.map((r) => `
     <div class="repo-row">
-      <span>${r.fullName}${me.defaultRepo && me.defaultRepo.fullName === r.fullName ? " ⭐" : ""}</span>
+      <span>${r.fullName}${me.defaultRepo && me.defaultRepo.fullName === r.fullName ? " ⭐" : ""}${activeRepoInfo && activeRepoInfo.fullName === r.fullName ? " (active)" : ""}</span>
       <span style="display:flex; gap:6px;">
         <button class="secondary" data-action="use" data-owner="${r.owner}" data-name="${r.name}">Use</button>
         <button data-action="default" data-owner="${r.owner}" data-name="${r.name}">Set default</button>
@@ -137,9 +155,18 @@ function setupTopBar() {
 // ---------------- main tool logic (only runs once a repo is active) ----------------
 
 let mainViewInitialized = false;
+let refreshRepoData = null; // set by initTool(); re-run whenever the active repo changes
+
 function initMainView() {
   setupTopBar();
-  if (mainViewInitialized) return; // avoid double-binding listeners on repeat switches
+  if (mainViewInitialized) {
+    // We've already bound the tool's listeners once - but the ACTIVE REPO has just
+    // changed (Switch repo / Set default), so the tree + staged state must be
+    // reloaded against the new repo instead of silently showing stale data from
+    // whichever repo happened to load first.
+    if (refreshRepoData) refreshRepoData();
+    return;
+  }
   mainViewInitialized = true;
   initTool();
 }
@@ -157,18 +184,30 @@ const statusEl = document.getElementById("status");
 const undoBtn = document.getElementById("undoBtn");
 const redoBtn = document.getElementById("redoBtn");
 
+attachCustomScroll(treePane);
+attachCustomScroll(stagePane);
+
 // ---------- state ----------
 // staged items the user built up before hitting Upload
-let staged = [];         // [{ id, partId, partName, name, replaceTarget, archiveMode }]
-let pendingDeletes = []; // [path] - trash-icon deletes on existing tree files
-let treeEntries = [];    // raw entries from /api/tree
+let staged = [];              // [{ id, partId, partName, name, replaceTarget, destinationPath, archiveMode }]
+let pendingDeletes = [];      // [realPath] - trash-icon deletes on existing tree FILES
+let pendingFolderDeletes = [];// [realPath] - trash-icon deletes on existing tree FOLDERS (recursive)
+let pendingFolderCreates = [];// [displayPath] - new, not-yet-created folders
+let pendingRenames = {};      // realPath -> { newPath, isFolder } - renames/moves, applied at commit time
+let treeEntries = [];         // raw entries from /api/tree
 
-let history = [];  // undo/redo stack of {staged, pendingDeletes} snapshots
+let history = [];  // undo/redo stack of state snapshots
 let historyIndex = -1;
 
 function snapshot() {
   history = history.slice(0, historyIndex + 1);
-  history.push({ staged: JSON.parse(JSON.stringify(staged)), pendingDeletes: [...pendingDeletes] });
+  history.push({
+    staged: JSON.parse(JSON.stringify(staged)),
+    pendingDeletes: [...pendingDeletes],
+    pendingFolderDeletes: [...pendingFolderDeletes],
+    pendingFolderCreates: [...pendingFolderCreates],
+    pendingRenames: JSON.parse(JSON.stringify(pendingRenames)),
+  });
   historyIndex++;
 }
 function undo() {
@@ -184,6 +223,9 @@ function redo() {
 function restore(snap) {
   staged = JSON.parse(JSON.stringify(snap.staged));
   pendingDeletes = [...snap.pendingDeletes];
+  pendingFolderDeletes = [...snap.pendingFolderDeletes];
+  pendingFolderCreates = [...snap.pendingFolderCreates];
+  pendingRenames = JSON.parse(JSON.stringify(snap.pendingRenames));
   renderStage();
   renderTree();
 }
@@ -218,12 +260,13 @@ async function loadParts() {
 }
 
 async function loadTree() {
+  treePane.innerHTML = `<div style="opacity:0.5;">Loading…</div>`;
   const res = await fetch("/api/tree");
   const { entries } = await res.json();
-  treeEntries = entries;
+  treeEntries = entries || [];
   if (!treeLoadedOnce) {
     // Default every folder to collapsed the first time the tree loads
-    entries.filter((e) => e.type === "folder").forEach((e) => collapsedPaths.add(e.path));
+    treeEntries.filter((e) => e.type === "folder").forEach((e) => collapsedPaths.add(e.path));
     treeLoadedOnce = true;
   }
   renderTree();
@@ -244,32 +287,99 @@ stageBtn.addEventListener("click", () => {
       partName: opt.textContent,
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
-      archiveMode: "archive",
+      destinationPath: null,
+      archiveMode: "archive",      // "archive" or "delete" - what happens to the file it replaces
     });
   }
   snapshot();
   renderStage();
 });
 
-// ---------- tree rendering (nested by path) ----------
+// ---------- tree rendering (nested by path, with pending create/rename/delete overlaid) ----------
+
+// Builds the tree the user currently SEES: real entries from GitHub, with
+// pending renames/moves applied, pending new folders added, and '.gitkeep'
+// placeholders hidden. Nothing here touches the server - it's all local
+// until Upload is clicked.
+function computeVirtualEntries() {
+  let entries = treeEntries
+    .filter((e) => !e.path.endsWith("/.gitkeep"))
+    .map((e) => ({ realPath: e.path, path: e.path, type: e.type }));
+
+  entries = entries.map((e) => {
+    for (const realPath of Object.keys(pendingRenames)) {
+      const r = pendingRenames[realPath];
+      if (e.realPath === realPath) return { ...e, path: r.newPath };
+      if (r.isFolder && e.realPath.startsWith(realPath + "/")) {
+        return { ...e, path: r.newPath + e.realPath.slice(realPath.length) };
+      }
+    }
+    return e;
+  });
+
+  for (const folderPath of pendingFolderCreates) {
+    if (!entries.some((e) => e.path === folderPath)) {
+      entries.push({ realPath: null, path: folderPath, type: "folder", __pendingNew: true });
+    }
+  }
+  return entries;
+}
 
 function buildNestedTree(entries) {
   const root = {};
   for (const e of entries) {
-    if (e.path.endsWith("/.gitkeep")) continue; // hide placeholder files
     const parts = e.path.split("/");
     let node = root;
     parts.forEach((part, i) => {
       const isLast = i === parts.length - 1;
-      if (!node[part]) node[part] = { __children: {}, __isFile: isLast && e.type === "file", __path: parts.slice(0, i + 1).join("/") };
+      const fullPath = parts.slice(0, i + 1).join("/");
+      if (!node[part]) {
+        node[part] = { __children: {}, __isFile: false, __path: fullPath, __realPath: fullPath, __pendingNew: false };
+      }
+      if (isLast) {
+        node[part].__isFile = e.type === "file";
+        node[part].__realPath = e.realPath !== undefined ? e.realPath : fullPath;
+        node[part].__pendingNew = !!e.__pendingNew;
+      }
       node = node[part].__children;
     });
   }
   return root;
 }
 
+// Renames/moves any staged reference (a not-yet-created folder path, or a
+// staged file's chosen destination) so state stays consistent when the user
+// renames or drags a folder that other pending actions already point into.
+function remapDisplayPath(oldPath, newPath) {
+  const rewrite = (p) => (p === oldPath ? newPath : (p.startsWith(oldPath + "/") ? newPath + p.slice(oldPath.length) : p));
+  pendingFolderCreates = pendingFolderCreates.map(rewrite);
+  staged.forEach((s) => {
+    if (s.destinationPath) s.destinationPath = rewrite(s.destinationPath);
+    if (s.replaceTarget) s.replaceTarget = rewrite(s.replaceTarget);
+  });
+  for (const key of Object.keys(pendingRenames)) {
+    pendingRenames[key].newPath = rewrite(pendingRenames[key].newPath);
+  }
+}
+
+// Point a tree entry (file or folder, real or pending-new) at a new path -
+// used by both inline rename and drag-to-reorganize.
+function retargetEntry(entry, newPath) {
+  if (newPath === entry.__path) return;
+  if (entry.__pendingNew) {
+    remapDisplayPath(entry.__path, newPath);
+  } else {
+    pendingRenames[entry.__realPath] = { newPath, isFolder: !entry.__isFile };
+  }
+  snapshot();
+  renderTree();
+}
+
+let editingTreePath = null;   // display path of the row currently showing an inline rename input
+let creatingFolderIn = null;  // display path of the folder currently showing an inline "new folder" input (or "" for root), null = none
+
 function renderTree() {
-  const nested = buildNestedTree(treeEntries);
+  const nested = buildNestedTree(computeVirtualEntries());
   treePane.innerHTML = `
     <div class="tree-header">
       <span style="opacity:0.5; font-size:10px;">repo root</span>
@@ -277,89 +387,195 @@ function renderTree() {
     </div>
     <div id="treeRoot"></div>
   `;
-  document.getElementById("treeRoot").appendChild(renderNode(nested, 0));
-  document.getElementById("newFolderBtn").addEventListener("click", () => createFolder(""));
+  const treeRoot = document.getElementById("treeRoot");
+  treeRoot.appendChild(renderNode(nested, 0, ""));
+  if (creatingFolderIn === "") treeRoot.appendChild(buildInlineCreateRow(""));
+
+  // allow dropping a dragged tree item onto empty space / the root to move it to top level
+  treeRoot.addEventListener("dragover", (e) => {
+    if (!draggingTreePath) return;
+    e.preventDefault();
+  });
+  treeRoot.addEventListener("drop", (e) => {
+    if (!draggingTreePath) return;
+    e.preventDefault();
+    handleTreeMoveDrop("", e);
+  });
+
+  document.getElementById("newFolderBtn").addEventListener("click", () => {
+    collapsedPaths.delete("");
+    creatingFolderIn = "";
+    renderTree();
+  });
+}
+
+function buildInlineCreateRow(parentPath) {
+  const row = document.createElement("div");
+  row.className = "row folder";
+  row.style.marginLeft = "14px";
+  row.style.cursor = "default";
+  row.innerHTML = `${FOLDER_SVG}`;
+  const input = document.createElement("input");
+  input.className = "tree-inline-input";
+  input.placeholder = "Folder name";
+  row.appendChild(input);
+  const commit = () => {
+    const val = input.value.trim();
+    if (val) {
+      const full = parentPath ? `${parentPath}/${val}` : val;
+      if (!pendingFolderCreates.includes(full)) {
+        pendingFolderCreates.push(full);
+        snapshot();
+      }
+    }
+    creatingFolderIn = null;
+    renderTree();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") commit();
+    if (e.key === "Escape") { creatingFolderIn = null; renderTree(); }
+  });
+  input.addEventListener("blur", commit);
+  setTimeout(() => input.focus(), 0);
+  return row;
 }
 
 const FOLDER_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 3.5h4l1.5 2h7v7h-12.5z"/></svg>`;
 const FILE_SVG = `<svg class="tree-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></svg>`;
 const collapsedPaths = new Set();
 let treeLoadedOnce = false;
+let draggingTreePath = null; // display path of the tree row currently being dragged (for move/reorganize)
 
-function renderNode(node, depth) {
+function renderNode(node, depth, parentPath) {
   const wrap = document.createElement("div");
   for (const key of Object.keys(node).sort()) {
     const entry = node[key];
     const isFile = entry.__isFile;
     const hasChildren = Object.keys(entry.__children).length > 0;
     const isCollapsed = collapsedPaths.has(entry.__path);
+    const isDeleted = isFile ? pendingDeletes.includes(entry.__realPath) : pendingFolderDeletes.includes(entry.__realPath);
 
     const row = document.createElement("div");
     row.className = "tree-node";
     row.innerHTML = `<div class="tree-line"></div>`;
 
     const inner = document.createElement("div");
-    inner.className = "row" + (isFile ? "" : " folder");
+    inner.className = "row" + (isFile ? "" : " folder") + (entry.__pendingNew ? " pending-new" : "") + (isDeleted ? " pending-delete" : "");
     inner.dataset.path = entry.__path;
-    inner.innerHTML = `
-      <span class="row-label">
-        <span class="tree-toggle">${!isFile && hasChildren ? (isCollapsed ? "▸" : "▾") : ""}</span>
-        ${isFile ? FILE_SVG : FOLDER_SVG}
-        ${key}
-      </span>
-      <span class="row-actions">
-        <span class="rename-icon" title="Rename">✎</span>
-        ${isFile ? '<span class="delete-icon" title="Delete">🗑</span>' : ""}
-      </span>
-    `;
+    inner.draggable = editingTreePath === null;
 
-    if (!isFile && hasChildren) {
-      inner.querySelector(".tree-toggle").addEventListener("click", (e) => {
+    if (editingTreePath === entry.__path) {
+      inner.innerHTML = `<span class="row-label" style="flex:1;">${isFile ? FILE_SVG : FOLDER_SVG}</span>`;
+      const input = document.createElement("input");
+      input.className = "tree-inline-input";
+      input.value = key;
+      inner.querySelector(".row-label").appendChild(input);
+      const commit = () => {
+        const val = input.value.trim();
+        editingTreePath = null;
+        if (val && val !== key) {
+          const newPath = parentPath ? `${parentPath}/${val}` : val;
+          retargetEntry(entry, newPath);
+        } else {
+          renderTree();
+        }
+      };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") { editingTreePath = null; renderTree(); }
+      });
+      input.addEventListener("blur", commit);
+      setTimeout(() => { input.focus(); input.select(); }, 0);
+    } else {
+      inner.innerHTML = `
+        <span class="row-label">
+          <span class="tree-toggle">${!isFile && hasChildren ? (isCollapsed ? "▸" : "▾") : ""}</span>
+          ${isFile ? FILE_SVG : FOLDER_SVG}
+          ${key}${entry.__pendingNew ? " (new)" : ""}${isDeleted ? " (will delete)" : ""}
+        </span>
+        <span class="row-actions">
+          ${!isFile ? '<span class="addsub-icon" title="New subfolder">＋</span>' : ""}
+          <span class="rename-icon" title="Rename">✎</span>
+          <span class="delete-icon" title="${isFile ? "Delete" : "Delete folder"}">🗑</span>
+        </span>
+      `;
+
+      if (!isFile && hasChildren) {
+        inner.querySelector(".tree-toggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (collapsedPaths.has(entry.__path)) collapsedPaths.delete(entry.__path);
+          else collapsedPaths.add(entry.__path);
+          renderTree();
+        });
+      }
+
+      inner.querySelector(".rename-icon").addEventListener("click", (e) => {
         e.stopPropagation();
-        if (collapsedPaths.has(entry.__path)) collapsedPaths.delete(entry.__path);
-        else collapsedPaths.add(entry.__path);
+        editingTreePath = entry.__path;
         renderTree();
       });
-    }
 
-    inner.querySelector(".rename-icon").addEventListener("click", (e) => {
-      e.stopPropagation();
-      renamePath(entry.__path, isFile);
-    });
-    const delIcon = inner.querySelector(".delete-icon");
-    if (delIcon) {
-      delIcon.addEventListener("click", (e) => {
+      inner.querySelector(".delete-icon").addEventListener("click", (e) => {
         e.stopPropagation();
-        toggleDelete(entry.__path, inner);
+        if (isFile) toggleFileDelete(entry);
+        else toggleFolderDelete(entry);
       });
+
+      const addSub = inner.querySelector(".addsub-icon");
+      if (addSub) {
+        addSub.addEventListener("click", (e) => {
+          e.stopPropagation();
+          collapsedPaths.delete(entry.__path);
+          creatingFolderIn = entry.__path;
+          renderTree();
+        });
+      }
+
+      // dragging THIS row to reorganize the tree
+      inner.addEventListener("dragstart", (e) => {
+        draggingTreePath = entry.__path;
+        e.dataTransfer.setData("application/x-tree-move", entry.__path);
+        e.stopPropagation();
+      });
+      inner.addEventListener("dragend", () => { draggingTreePath = null; });
     }
 
+    // drop target behavior
     if (isFile) {
       inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
       inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
       inner.addEventListener("drop", (e) => {
         e.preventDefault();
+        e.stopPropagation();
         inner.classList.remove("dragover");
-        const stagedId = e.dataTransfer.getData("text/plain");
+        if (e.dataTransfer.types.includes("application/x-tree-move")) return; // dropping a file onto a file isn't a valid move target
+        const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
         assignReplacement(stagedId, entry.__path, inner);
       });
     } else {
-      // dropping onto a folder = add as new file there, no replacement
+      // dropping onto a folder = add as new file there (no replacement), OR move a dragged tree item into it
       inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
       inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
       inner.addEventListener("drop", (e) => {
         e.preventDefault();
+        e.stopPropagation();
         inner.classList.remove("dragover");
-        const stagedId = e.dataTransfer.getData("text/plain");
+        if (e.dataTransfer.types.includes("application/x-tree-move")) {
+          handleTreeMoveDrop(entry.__path, e);
+          return;
+        }
+        const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
         assignDestination(stagedId, entry.__path);
       });
     }
 
     row.appendChild(inner);
-    if (hasChildren && !isCollapsed) {
+    const showCreateRow = creatingFolderIn === entry.__path;
+    if ((hasChildren && !isCollapsed) || showCreateRow) {
       const childWrap = document.createElement("div");
       childWrap.style.marginLeft = "10px";
-      childWrap.appendChild(renderNode(entry.__children, depth + 1));
+      if (hasChildren && !isCollapsed) childWrap.appendChild(renderNode(entry.__children, depth + 1, entry.__path));
+      if (showCreateRow) childWrap.appendChild(buildInlineCreateRow(entry.__path));
       row.appendChild(childWrap);
     }
     wrap.appendChild(row);
@@ -367,39 +583,59 @@ function renderNode(node, depth) {
   return wrap;
 }
 
-function toggleDelete(path, rowEl) {
-  const idx = pendingDeletes.indexOf(path);
-  if (idx === -1) {
-    pendingDeletes.push(path);
-    rowEl.style.background = "#5c1e1e";
+function handleTreeMoveDrop(destFolderPath, e) {
+  const path = draggingTreePath || e.dataTransfer.getData("application/x-tree-move");
+  if (!path) return;
+  const entry = findVirtualEntryByPath(path);
+  if (!entry) return;
+  if (destFolderPath === path || destFolderPath.startsWith(path + "/")) return; // can't drop a folder into itself
+  const baseName = path.split("/").pop();
+  const newPath = destFolderPath ? `${destFolderPath}/${baseName}` : baseName;
+  retargetEntry(entry, newPath);
+}
+
+// Look up a node (with __path/__realPath/__isFile/__pendingNew) in the current virtual tree by its display path
+function findVirtualEntryByPath(targetPath) {
+  const nested = buildNestedTree(computeVirtualEntries());
+  const parts = targetPath.split("/");
+  let node = nested;
+  let found = null;
+  for (const part of parts) {
+    if (!node[part]) return null;
+    found = node[part];
+    node = node[part].__children;
+  }
+  return found;
+}
+
+function toggleFileDelete(entry) {
+  const idx = pendingDeletes.indexOf(entry.__realPath);
+  if (idx === -1) pendingDeletes.push(entry.__realPath);
+  else pendingDeletes.splice(idx, 1);
+  snapshot();
+  renderTree();
+}
+
+function toggleFolderDelete(entry) {
+  if (entry.__pendingNew) {
+    // cancel a not-yet-created folder outright, and detach anything staged into it
+    pendingFolderCreates = pendingFolderCreates.filter((p) => p !== entry.__path && !p.startsWith(entry.__path + "/"));
+    staged.forEach((s) => {
+      if (s.destinationPath === entry.__path || (s.destinationPath || "").startsWith(entry.__path + "/")) s.destinationPath = null;
+    });
   } else {
-    pendingDeletes.splice(idx, 1);
-    rowEl.style.background = "";
+    const idx = pendingFolderDeletes.indexOf(entry.__realPath);
+    if (idx === -1) pendingFolderDeletes.push(entry.__realPath);
+    else pendingFolderDeletes.splice(idx, 1);
   }
   snapshot();
-}
-
-async function createFolder(parentPath) {
-  const name = prompt("New folder name:");
-  if (!name) return;
-  const folderPath = parentPath ? `${parentPath}/${name}` : name;
-  await fetch("/api/folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folderPath }) });
-  await loadTree();
-}
-
-async function renamePath(oldPath, isFile) {
-  const currentName = oldPath.split("/").pop();
-  const newName = prompt("Rename to:", currentName);
-  if (!newName || newName === currentName) return;
-  const parent = oldPath.substring(0, oldPath.lastIndexOf("/"));
-  const newPath = parent ? `${parent}/${newName}` : newName;
-  await fetch("/api/rename", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ oldPath, newPath, isFolder: !isFile }) });
-  await loadTree();
+  renderTree();
 }
 
 // ---------- staging pane ----------
 
-let editingId = null; // which staged card is currently in inline-rename mode
+let editingId = null;     // which staged card is currently in inline-rename mode
+let draggingStagedId = null;
 
 function renderStage() {
   if (!staged.length) {
@@ -427,19 +663,65 @@ function renderStage() {
       // defer focus so it happens after the input is actually in the DOM
       setTimeout(() => { input.focus(); input.select(); }, 0);
     } else {
+      const dest = item.replaceTarget
+        ? ` → replaces ${item.replaceTarget.split("/").pop()}`
+        : (item.destinationPath ? ` → ${item.destinationPath}/` : "");
       card.innerHTML = `
-        <span class="row-label">${FILE_SVG} ${item.name}${item.replaceTarget ? ` → replaces ${item.replaceTarget.split("/").pop()}` : ""}</span>
+        <span class="row-label">${FILE_SVG} ${item.name}${dest}</span>
         <span class="row-actions">
+          ${item.replaceTarget ? `<span class="mode-icon" title="${item.archiveMode === "delete" ? "Old file will be deleted - click to archive instead" : "Old file will be archived - click to delete instead"}">${item.archiveMode === "delete" ? "🗑" : "🗄"}</span>` : ""}
           <span class="rename-icon" title="Rename">✎</span>
           <span class="unstage-icon" title="Remove" style="color:#e5534b;">✕</span>
         </span>
       `;
       card.addEventListener("dragstart", (e) => {
         card.classList.add("dragging");
-        e.dataTransfer.setData("text/plain", item.id);
+        draggingStagedId = item.id;
+        e.dataTransfer.setData("application/x-staged-id", item.id);
+        e.dataTransfer.setData("text/plain", item.id); // fallback for older drop targets
       });
-      card.addEventListener("dragend", () => card.classList.remove("dragging"));
+      card.addEventListener("dragend", () => {
+        card.classList.remove("dragging");
+        draggingStagedId = null;
+      });
 
+      // reordering: drag one staged card above/below another
+      card.addEventListener("dragover", (e) => {
+        if (!draggingStagedId || draggingStagedId === item.id) return;
+        e.preventDefault();
+        const rect = card.getBoundingClientRect();
+        const before = (e.clientY - rect.top) < rect.height / 2;
+        card.classList.toggle("drop-before", before);
+        card.classList.toggle("drop-after", !before);
+      });
+      card.addEventListener("dragleave", () => card.classList.remove("drop-before", "drop-after"));
+      card.addEventListener("drop", (e) => {
+        if (!e.dataTransfer.types.includes("application/x-staged-id")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        card.classList.remove("drop-before", "drop-after");
+        const draggedId = e.dataTransfer.getData("application/x-staged-id");
+        if (!draggedId || draggedId === item.id) return;
+        const draggedIdx = staged.findIndex((s) => s.id === draggedId);
+        if (draggedIdx === -1) return;
+        const [draggedItem] = staged.splice(draggedIdx, 1);
+        let targetIdx = staged.findIndex((s) => s.id === item.id);
+        const rect = card.getBoundingClientRect();
+        const before = (e.clientY - rect.top) < rect.height / 2;
+        if (!before) targetIdx++;
+        staged.splice(targetIdx, 0, draggedItem);
+        snapshot();
+        renderStage();
+      });
+
+      const modeIcon = card.querySelector(".mode-icon");
+      if (modeIcon) {
+        modeIcon.addEventListener("click", () => {
+          item.archiveMode = item.archiveMode === "delete" ? "archive" : "delete";
+          snapshot();
+          renderStage();
+        });
+      }
       card.querySelector(".rename-icon").addEventListener("click", () => {
         editingId = item.id; // dims every other card until this one is committed
         renderStage();
@@ -460,7 +742,7 @@ function assignReplacement(stagedId, targetPath, rowEl) {
   if (!item) return;
   item.replaceTarget = targetPath;
   item.destinationPath = null;
-  // little "flies off" cue on the tree row to signal it'll be archived on commit
+  // little "flies off" cue on the tree row to signal it'll be archived/deleted on commit
   rowEl.classList.add("flying-away");
   setTimeout(() => rowEl.classList.remove("flying-away"), 350);
   snapshot();
@@ -485,7 +767,11 @@ partSelect.addEventListener("change", () => {
 // ---------- commit ----------
 
 uploadBtn.addEventListener("click", async () => {
-  if (!staged.length && !pendingDeletes.length) {
+  const renamesArr = Object.entries(pendingRenames)
+    .map(([oldPath, r]) => ({ oldPath, newPath: r.newPath, isFolder: r.isFolder }))
+    .filter((r) => r.oldPath !== r.newPath);
+
+  if (!staged.length && !pendingDeletes.length && !pendingFolderDeletes.length && !pendingFolderCreates.length && !renamesArr.length) {
     setStatus("Nothing staged.");
     return;
   }
@@ -532,13 +818,22 @@ uploadBtn.addEventListener("click", async () => {
     const res = await fetch("/api/commit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deletes: pendingDeletes, items }),
+      body: JSON.stringify({
+        deletes: pendingDeletes,
+        folderDeletes: pendingFolderDeletes,
+        folderCreates: pendingFolderCreates,
+        renames: renamesArr,
+        items,
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Commit failed");
     setStatus("Done:\n" + data.results.map((r) => `${r.path} — ${r.action}`).join("\n"));
     staged = [];
     pendingDeletes = [];
+    pendingFolderDeletes = [];
+    pendingFolderCreates = [];
+    pendingRenames = {};
     history = []; historyIndex = -1;
     renderStage();
     await loadTree();
@@ -551,9 +846,25 @@ uploadBtn.addEventListener("click", async () => {
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
-loadParts();
-loadTree();
-snapshot();
+// Full reset + reload, run once on first init AND every time the active repo changes
+refreshRepoData = () => {
+  staged = [];
+  pendingDeletes = [];
+  pendingFolderDeletes = [];
+  pendingFolderCreates = [];
+  pendingRenames = {};
+  editingId = null;
+  editingTreePath = null;
+  creatingFolderIn = null;
+  collapsedPaths.clear();
+  treeLoadedOnce = false;
+  history = []; historyIndex = -1;
+  renderStage();
+  loadParts();
+  loadTree();
+  snapshot();
+};
+refreshRepoData();
 }
 
 checkAuth();

@@ -290,6 +290,68 @@ async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicrovers
 }
 
 // ---------- folder create / rename ----------
+//
+// These low-level helpers are shared by the standalone /api/folder + /api/rename
+// endpoints (kept for compatibility) AND by /api/commit, which is what the panel
+// actually calls now - folder creates/deletes/renames are queued client-side and
+// only touch GitHub once, in the same batched commit as everything else, instead
+// of firing immediately when the user clicks "new folder"/"rename".
+
+async function getRepoTree(req) {
+  const { owner, name } = activeRepo(req);
+  const octokit = octokitFor(req);
+  const { data: repoData } = await octokit.repos.get({ owner, repo: name });
+  const branch = repoData.default_branch;
+  const { data: refData } = await octokit.git.getRef({ owner, repo: name, ref: `heads/${branch}` });
+  const { data: commitData } = await octokit.git.getCommit({ owner, repo: name, commit_sha: refData.object.sha });
+  const { data: treeData } = await octokit.git.getTree({ owner, repo: name, tree_sha: commitData.tree.sha, recursive: "true" });
+  return treeData.tree;
+}
+
+async function applyRename(req, oldPath, newPath, isFolder) {
+  if (isFolder) {
+    const tree = await getRepoTree(req);
+    const affected = tree.filter((e) => e.type === "blob" && (e.path === oldPath || e.path.startsWith(oldPath + "/")));
+    for (const entry of affected) {
+      const file = await getFile(req, entry.path);
+      if (!file) continue;
+      const relative = entry.path.substring(oldPath.length);
+      await putFile(req, `${newPath}${relative}`, Buffer.from(file.content, "base64"), `chore: move ${entry.path} -> ${newPath}${relative}`);
+      await deleteFile(req, entry.path, `chore: remove old path after folder move`, file.sha);
+    }
+  } else {
+    const file = await getFile(req, oldPath);
+    if (!file) return;
+    await putFile(req, newPath, Buffer.from(file.content, "base64"), `chore: rename ${oldPath} -> ${newPath}`);
+    await deleteFile(req, oldPath, `chore: remove old path after rename`, file.sha);
+  }
+}
+
+async function applyFolderDelete(req, folderPath) {
+  const tree = await getRepoTree(req);
+  const affected = tree.filter((e) => e.type === "blob" && (e.path === folderPath || e.path.startsWith(folderPath + "/")));
+  for (const entry of affected) {
+    await deleteFile(req, entry.path, `chore: delete folder ${folderPath}`, entry.sha);
+  }
+}
+
+// Looks for an existing "archive" folder (any casing) directly inside parentFolder,
+// so replaced files land next to whatever archive folder the user already has
+// (e.g. "Fuselage/Archive") instead of always creating a fresh "Archive" folder.
+async function findArchiveFolderName(req, parentFolder) {
+  const { owner, name } = activeRepo(req);
+  const octokit = octokitFor(req);
+  try {
+    const { data } = await octokit.repos.getContent({ owner, repo: name, path: parentFolder || "" });
+    if (Array.isArray(data)) {
+      const found = data.find((e) => e.type === "dir" && e.name.toLowerCase() === "archive");
+      if (found) return found.name;
+    }
+  } catch (err) {
+    // parentFolder may not exist yet (e.g. brand-new destination) - fall back below
+  }
+  return "Archive";
+}
 
 app.post("/api/folder", requireAuth, async (req, res) => {
   const { folderPath } = req.body;
@@ -306,30 +368,8 @@ app.post("/api/folder", requireAuth, async (req, res) => {
 app.post("/api/rename", requireAuth, async (req, res) => {
   const { oldPath, newPath, isFolder } = req.body;
   if (!oldPath || !newPath) return res.status(400).json({ error: "oldPath and newPath required" });
-  const { owner, name } = activeRepo(req);
-  const octokit = octokitFor(req);
-
   try {
-    if (isFolder) {
-      const { data: repoData } = await octokit.repos.get({ owner, repo: name });
-      const branch = repoData.default_branch;
-      const { data: refData } = await octokit.git.getRef({ owner, repo: name, ref: `heads/${branch}` });
-      const { data: commitData } = await octokit.git.getCommit({ owner, repo: name, commit_sha: refData.object.sha });
-      const { data: treeData } = await octokit.git.getTree({ owner, repo: name, tree_sha: commitData.tree.sha, recursive: "true" });
-      const affected = treeData.tree.filter((e) => e.type === "blob" && e.path.startsWith(oldPath + "/"));
-
-      for (const entry of affected) {
-        const file = await getFile(req, entry.path);
-        const relative = entry.path.substring(oldPath.length);
-        await putFile(req, `${newPath}${relative}`, Buffer.from(file.content, "base64"), `chore: move ${entry.path} -> ${newPath}${relative}`);
-        await deleteFile(req, entry.path, `chore: remove old path after folder rename`, file.sha);
-      }
-    } else {
-      const file = await getFile(req, oldPath);
-      if (!file) return res.status(404).json({ error: "File not found" });
-      await putFile(req, newPath, Buffer.from(file.content, "base64"), `chore: rename ${oldPath} -> ${newPath}`);
-      await deleteFile(req, oldPath, `chore: remove old path after rename`, file.sha);
-    }
+    await applyRename(req, oldPath, newPath, isFolder);
     res.json({ success: true });
   } catch (err) {
     console.error(err.response?.data || err.message);
@@ -345,7 +385,7 @@ const FORMAT_EXTENSIONS = {
 
 app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
-  const { deletes = [], items = [] } = req.body;
+  const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [] } = req.body;
   // NOTE: no top-level documentId/workspaceId needed anymore - each staged
   // part already carries its own sourceDocumentId/sourceMicroversion/
   // sourceElementId, which is what actually determines where a translation
@@ -354,12 +394,36 @@ app.post("/api/commit", requireAuth, async (req, res) => {
   try {
     const results = [];
 
+    // Renames/moves and folder deletes queued while the user was working in
+    // the tree get applied first, so everything downstream (deletes, archive
+    // lookups, replace targets) sees the tree in its final shape.
+    for (const r of renames) {
+      await applyRename(req, r.oldPath, r.newPath, r.isFolder);
+      results.push({ path: `${r.oldPath} → ${r.newPath}`, action: r.isFolder ? "folder moved" : "renamed" });
+    }
+
+    for (const folderPath of folderDeletes) {
+      await applyFolderDelete(req, folderPath);
+      results.push({ path: folderPath, action: "folder deleted" });
+    }
+
     for (const targetPath of deletes) {
       const existing = await getFile(req, targetPath);
       if (existing) {
         await deleteFile(req, targetPath, `chore: delete ${targetPath}`, existing.sha);
         results.push({ path: targetPath, action: "deleted" });
       }
+    }
+
+    // Empty new folders need a placeholder to exist in git at all - but skip
+    // creating one if a file is being uploaded straight into that folder in
+    // this same commit, since the file itself is enough to establish it (that's
+    // also what avoids leaving a stray blank .gitkeep sitting next to real files).
+    const destinationsThisCommit = new Set(items.map((it) => it.destinationPath).filter(Boolean));
+    for (const folderPath of folderCreates) {
+      if (destinationsThisCommit.has(folderPath)) continue;
+      await putFile(req, `${folderPath}/.gitkeep`, Buffer.from(""), `feat: create folder ${folderPath}`);
+      results.push({ path: folderPath, action: "folder created" });
     }
 
     for (const item of items) {
@@ -398,7 +462,10 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         } else {
           const folder = targetPath.substring(0, targetPath.lastIndexOf("/"));
           const oldFilename = targetPath.substring(targetPath.lastIndexOf("/") + 1);
-          await putFile(req, `${folder}/Archive/${oldFilename}`, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
+          // Look for whatever "archive" folder already exists in this folder
+          // (any casing) rather than always assuming one named exactly "Archive".
+          const archiveFolderName = await findArchiveFolderName(req, folder);
+          await putFile(req, `${folder}/${archiveFolderName}/${oldFilename}`, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
           await deleteFile(req, targetPath, `chore: remove old ${oldFilename} (archived)`, existing.sha);
         }
       }

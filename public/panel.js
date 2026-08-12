@@ -177,6 +177,7 @@ const stageBtn = document.getElementById("stageBtn");
 const treePane = document.getElementById("treePane");
 const stagePane = document.getElementById("stagePane");
 const staticCheck = document.getElementById("staticCheck");
+const deleteInsteadCheck = document.getElementById("deleteInsteadCheck");
 const formatSelect = document.getElementById("formatSelect");
 let partsById = {}; // occurrence id -> full part info (name, partId, sourceElementId)
 const uploadBtn = document.getElementById("uploadBtn");
@@ -288,7 +289,7 @@ stageBtn.addEventListener("click", () => {
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
       destinationPath: null,
-      archiveMode: "archive",      // "archive" or "delete" - what happens to the file it replaces
+      archiveMode: deleteInsteadCheck.checked ? "delete" : "archive", // what happens to the file it replaces - defaults from the settings checkbox, overridable per-card via the 🗄/🗑 toggle
     });
   }
   snapshot();
@@ -489,7 +490,7 @@ function renderNode(node, depth, parentPath) {
     } else {
       inner.innerHTML = `
         <span class="row-label">
-          <span class="tree-toggle">${!isFile && hasChildren ? (isCollapsed ? "▸" : "▾") : ""}</span>
+          <span class="tree-toggle">${!isFile ? (isCollapsed ? "▸" : "▾") : ""}</span>
           ${isFile ? FILE_SVG : FOLDER_SVG}
           ${key}${entry.__pendingNew ? " (new)" : ""}${isDeleted ? " (will delete)" : ""}
         </span>
@@ -500,7 +501,7 @@ function renderNode(node, depth, parentPath) {
         </span>
       `;
 
-      if (!isFile && hasChildren) {
+      if (!isFile) {
         inner.querySelector(".tree-toggle").addEventListener("click", (e) => {
           e.stopPropagation();
           if (collapsedPaths.has(entry.__path)) collapsedPaths.delete(entry.__path);
@@ -542,45 +543,81 @@ function renderNode(node, depth, parentPath) {
 
     // drop target behavior
     if (isFile) {
-      inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
-      inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
-      inner.addEventListener("drop", (e) => {
+      // Hovering the middle band of a file = replace it (archive/delete per that
+      // staged item's toggle). Hovering the top/bottom sliver = drop ABOVE/BELOW
+      // it instead - i.e. just add the staged file into the same folder as a
+      // sibling, no replace, no archiving. A dragged tree item (move) always just
+      // moves into this file's parent folder, regardless of vertical position -
+      // "replacing" a file with a moved file/folder isn't a supported move.
+      inner.addEventListener("dragover", (e) => {
         e.preventDefault();
-        e.stopPropagation();
-        inner.classList.remove("dragover");
-        if (e.dataTransfer.types.includes("application/x-tree-move")) return; // dropping a file onto a file isn't a valid move target
-        const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
-        assignReplacement(stagedId, entry.__path, inner);
-      });
-    } else {
-      // dropping onto a folder = add as new file there (no replacement), OR move a dragged tree item into it
-      inner.addEventListener("dragover", (e) => { e.preventDefault(); inner.classList.add("dragover"); });
-      inner.addEventListener("dragleave", () => inner.classList.remove("dragover"));
-      inner.addEventListener("drop", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        inner.classList.remove("dragover");
+        inner.classList.remove("dragover", "drop-before", "drop-after");
         if (e.dataTransfer.types.includes("application/x-tree-move")) {
-          handleTreeMoveDrop(entry.__path, e);
+          inner.classList.add("drop-before");
+          return;
+        }
+        const rect = inner.getBoundingClientRect();
+        const frac = (e.clientY - rect.top) / rect.height;
+        if (frac < 0.3) inner.classList.add("drop-before");
+        else if (frac > 0.7) inner.classList.add("drop-after");
+        else inner.classList.add("dragover");
+      });
+      inner.addEventListener("dragleave", () => inner.classList.remove("dragover", "drop-before", "drop-after"));
+      inner.addEventListener("drop", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const wasSibling = inner.classList.contains("drop-before") || inner.classList.contains("drop-after");
+        inner.classList.remove("dragover", "drop-before", "drop-after");
+        const parentPath = entry.__path.includes("/") ? entry.__path.substring(0, entry.__path.lastIndexOf("/")) : "";
+        if (e.dataTransfer.types.includes("application/x-tree-move")) {
+          handleTreeMoveDrop(parentPath, e); // moving a tree item onto a file always just moves it alongside, never "replaces"
           return;
         }
         const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
-        assignDestination(stagedId, entry.__path);
+        if (wasSibling) assignDestination(stagedId, parentPath);
+        else assignReplacement(stagedId, entry.__path, inner);
       });
+    } else {
+      // dropping onto a folder = add as new file there (no replacement), OR move a dragged tree item into it
+      bindFolderDropTarget(inner, entry);
     }
 
     row.appendChild(inner);
-    const showCreateRow = creatingFolderIn === entry.__path;
-    if ((hasChildren && !isCollapsed) || showCreateRow) {
+    if (!isFile && !isCollapsed) {
       const childWrap = document.createElement("div");
       childWrap.style.marginLeft = "10px";
-      if (hasChildren && !isCollapsed) childWrap.appendChild(renderNode(entry.__children, depth + 1, entry.__path));
-      if (showCreateRow) childWrap.appendChild(buildInlineCreateRow(entry.__path));
+      if (hasChildren) childWrap.appendChild(renderNode(entry.__children, depth + 1, entry.__path));
+      if (!hasChildren && creatingFolderIn !== entry.__path) {
+        // an empty folder still needs a visible, droppable target so you can
+        // actually get files/subfolders into it, not just a bare row
+        const emptyHint = document.createElement("div");
+        emptyHint.className = "empty-drop";
+        emptyHint.textContent = "drop files or folders here";
+        bindFolderDropTarget(emptyHint, entry);
+        childWrap.appendChild(emptyHint);
+      }
+      if (creatingFolderIn === entry.__path) childWrap.appendChild(buildInlineCreateRow(entry.__path));
       row.appendChild(childWrap);
     }
     wrap.appendChild(row);
   }
   return wrap;
+}
+
+function bindFolderDropTarget(el, entry) {
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("dragover"); });
+  el.addEventListener("dragleave", () => el.classList.remove("dragover"));
+  el.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove("dragover");
+    if (e.dataTransfer.types.includes("application/x-tree-move")) {
+      handleTreeMoveDrop(entry.__path, e);
+      return;
+    }
+    const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
+    assignDestination(stagedId, entry.__path);
+  });
 }
 
 function handleTreeMoveDrop(destFolderPath, e) {

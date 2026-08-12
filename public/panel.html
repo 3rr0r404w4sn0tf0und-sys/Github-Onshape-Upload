@@ -57,6 +57,10 @@
   .row.pending-new { color:#7ee787; }
   .row.pending-new .tree-icon { color:#7ee787; }
   .row.pending-delete { color:#e5534b; text-decoration:line-through; opacity:0.6; }
+  .row.drop-before { box-shadow: inset 0 2px 0 0 #5865F2; }
+  .row.drop-after { box-shadow: inset 0 -2px 0 0 #5865F2; }
+  .empty-drop { margin-left:16px; padding:5px 8px; font-size:10px; font-style:italic; opacity:0.4; border:1px dashed #444; border-radius:4px; }
+  .empty-drop.dragover { background:#5865F2; border-color:#5865F2; color:#fff; opacity:1; }
   .row-label { display:flex; align-items:center; gap:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .row-actions { display:flex; gap:8px; flex-shrink:0; opacity:0.6; }
   .row-actions span { cursor:pointer; }
@@ -125,6 +129,7 @@
         <span class="icon-btn" id="redoBtn" title="Redo">↷</span>
       </span>
     </div>
+    <label class="check" style="margin-top:6px;"><input type="checkbox" id="deleteInsteadCheck" /> Delete instead of archiving replaced files</label>
     <label style="font-size:10px; opacity:0.6; margin-top:8px;">File format</label>
     <select id="formatSelect">
       <option value="STEP">STEP</option>

@@ -220,15 +220,16 @@ app.get("/api/tree", requireAuth, async (req, res) => {
 // ---------- Onshape parts for the currently open tab ----------
 
 app.get("/api/parts", requireAuth, async (req, res) => {
-  const { documentId, workspaceId, elementId } = req.query;
-  if (!documentId || !workspaceId || !elementId) {
+  const { documentId, workspaceOrVersion, workspaceOrVersionId, elementId } = req.query;
+  if (!documentId || !workspaceOrVersion || !workspaceOrVersionId || !elementId) {
     return res.status(400).json({ error: "missing Onshape context params" });
   }
   try {
-    // Assembly context: list every part instance pulled into the assembly,
-    // which may originate from several different Part Studios (and, in rare
-    // cases, entirely different documents).
-    const url = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/w/${workspaceId}/e/${elementId}?includeMateFeatures=false`;
+    // workspaceOrVersion is "w" or "v" depending on whether you're viewing a
+    // live workspace or a frozen version - Onshape's generic element path
+    // pattern is /d/{did}/{w|v}/{wvid}/e/{eid}, so we build it dynamically
+    // rather than assuming "w".
+    const url = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}?includeMateFeatures=false`;
     const { data } = await axios.get(url, {
       headers: { Authorization: `Bearer ${req.session.onshapeAccessToken}` },
     });

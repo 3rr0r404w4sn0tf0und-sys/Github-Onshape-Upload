@@ -864,6 +864,7 @@ uploadBtn.addEventListener("click", async () => {
     sourceElementId: s.sourceElementId,
     sourceMicroversion: s.sourceMicroversion,
     partId: s.partId,
+    occurrenceId: s.occurrenceId, // needed for multi-part static merges - see server's exportAssemblyOccurrencesAsStep
   });
 
   const items = staticCheck.checked
@@ -896,6 +897,7 @@ uploadBtn.addEventListener("click", async () => {
         folderCreates: pendingFolderCreates,
         renames: renamesArr,
         items,
+        assemblyContext: ctx, // documentId/workspaceOrVersion/workspaceOrVersionId/elementId of the assembly tab this panel is open on - needed for multi-part static merges
       }),
     });
     const data = await res.json();

@@ -283,10 +283,10 @@ async function exportAssemblyOccurrencesAsStep(onshapeToken, assemblyContext, oc
     formatName: formatName || "STEP", partIds: occurrenceIds.join(","), onePartPerDoc: false, storeInDocument: false,
   }, { headers });
 
-  return downloadOnshapeTranslation(headers, job.id);
+  return downloadOnshapeTranslation(headers, documentId, job.id);
 }
 
-async function downloadOnshapeTranslation(headers, jobId) {
+async function downloadOnshapeTranslation(headers, documentId, jobId) {
   const statusUrl = `https://cad.onshape.com/api/v6/translations/${jobId}`;
   let result;
   for (let i = 0; i < 30; i++) {
@@ -297,8 +297,11 @@ async function downloadOnshapeTranslation(headers, jobId) {
   }
   if (!result) throw new Error("Onshape translation timed out");
 
+  // NOTE: the download endpoint is scoped under the owning document
+  // (/documents/d/{documentId}/externaldata/{fid}), NOT a bare
+  // /externaldata/{fid} - that was the source of the earlier 404.
   const fileId = result.resultExternalDataIds[0];
-  const downloadUrl = `https://cad.onshape.com/api/v6/externaldata/${fileId}`;
+  const downloadUrl = `https://cad.onshape.com/api/v6/documents/d/${documentId}/externaldata/${fileId}`;
   const { data: fileBuffer } = await axios.get(downloadUrl, { responseType: "arraybuffer", headers });
   return Buffer.from(fileBuffer);
 }
@@ -487,7 +490,15 @@ app.post("/api/commit", requireAuth, async (req, res) => {
     res.json({ success: true, results });
   } catch (err) {
     const failedUrl = err.config ? `${(err.config.method || "?").toUpperCase()} ${err.config.url}` : null;
-    const upstreamBody = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : null;
+    let upstreamBody = null;
+    if (err.response?.data) {
+      // axios can hand back the error body as a raw Buffer (e.g. when the
+      // request was made with responseType: "arraybuffer", as our file
+      // download calls are) - decode it to text instead of dumping a
+      // byte-array wall of numbers into the error message.
+      const raw = Buffer.isBuffer(err.response.data) ? err.response.data.toString("utf8") : JSON.stringify(err.response.data);
+      upstreamBody = raw.slice(0, 300);
+    }
     console.error(failedUrl, err.response?.status, upstreamBody || err.message);
     res.status(500).json({
       error: "Commit failed",

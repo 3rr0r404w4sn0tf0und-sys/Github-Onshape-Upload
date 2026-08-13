@@ -315,8 +315,9 @@ async function applyRename(req, oldPath, newPath, isFolder) {
     for (const entry of affected) {
       const file = await getFile(req, entry.path);
       if (!file) continue;
-      const relative = entry.path.substring(oldPath.length);
-      await putFile(req, `${newPath}${relative}`, Buffer.from(file.content, "base64"), `chore: move ${entry.path} -> ${newPath}${relative}`);
+      const relative = entry.path.substring(oldPath.length); // e.g. "/Sub/file.step", or "" if this IS the renamed path itself
+      const newFullPath = newPath ? `${newPath}${relative}` : relative.replace(/^\//, "");
+      await putFile(req, newFullPath, Buffer.from(file.content, "base64"), `chore: move ${entry.path} -> ${newFullPath}`);
       await deleteFile(req, entry.path, `chore: remove old path after folder move`, file.sha);
     }
   } else {
@@ -444,7 +445,7 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       }
 
       const filename = `${item.name}.${ext}`;
-      const targetPath = item.replaceTarget || `${item.destinationPath}/${filename}`;
+      const targetPath = item.replaceTarget || (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
       let buffer;
@@ -465,7 +466,8 @@ app.post("/api/commit", requireAuth, async (req, res) => {
           // Look for whatever "archive" folder already exists in this folder
           // (any casing) rather than always assuming one named exactly "Archive".
           const archiveFolderName = await findArchiveFolderName(req, folder);
-          await putFile(req, `${folder}/${archiveFolderName}/${oldFilename}`, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
+          const archivePath = folder ? `${folder}/${archiveFolderName}/${oldFilename}` : `${archiveFolderName}/${oldFilename}`;
+          await putFile(req, archivePath, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
           await deleteFile(req, targetPath, `chore: remove old ${oldFilename} (archived)`, existing.sha);
         }
       }

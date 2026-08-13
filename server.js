@@ -265,23 +265,15 @@ app.get("/api/parts", requireAuth, async (req, res) => {
 // Now uses the signed-in user's own Onshape OAuth token, so exports run
 // against whatever documents THEY have access to, not a shared dev account.
 
-async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicroversion, sourceElementId, partIds, merged, formatName) {
-  const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${sourceDocumentId}/m/${sourceMicroversion}/e/${sourceElementId}/translations`;
-  const headers = { Authorization: `Bearer ${onshapeToken}` };
-
-  const { data: job } = await axios.post(translateUrl, {
-    formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
-  }, { headers });
-
-  return downloadOnshapeTranslation(headers, job.id);
-}
-
-// Multi-part STATIC (merged) exports need to go through the ASSEMBLY's own
-// translation endpoint, not each part's Part Studio - a Part Studio export
-// only knows a part's position within its OWN Part Studio, not wherever the
-// assembly's mates ended up placing it. Translating from the assembly with
-// occurrence ids preserves the actual in-context (mated) transform, so merged
-// parts land assembled together instead of stacked at each part's own origin.
+// Every export - single part or multi-part static merge - now goes through
+// the ASSEMBLY's own translation endpoint, referencing occurrence ids, rather
+// than each part's underlying Part Studio. Two reasons: (1) a part occurrence
+// in an assembly doesn't necessarily even come from a Part Studio - it can be
+// a composite/derived part living in another assembly, and Onshape's
+// partstudios/.../translations endpoint 404s outright for those; (2) even for
+// plain Part Studio parts, the assembly endpoint is what actually knows where
+// mates put a part, which is what makes multi-part merges land assembled
+// instead of stacked at each part's own local origin.
 async function exportAssemblyOccurrencesAsStep(onshapeToken, assemblyContext, occurrenceIds, formatName) {
   const { documentId, workspaceOrVersion, workspaceOrVersionId, elementId } = assemblyContext;
   const translateUrl = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
@@ -410,10 +402,9 @@ app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
   const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [], assemblyContext = null } = req.body;
   // assemblyContext (documentId/workspaceOrVersion/workspaceOrVersionId/elementId)
-  // is the ASSEMBLY tab the panel is currently open on. Individual part exports
-  // don't need it (they export straight from each part's own Part Studio via
-  // sourceDocumentId/sourceMicroversion/sourceElementId), but multi-part STATIC
-  // exports do - see exportAssemblyOccurrencesAsStep.
+  // is the assembly tab this panel is open on - every export now goes through
+  // that assembly's translation endpoint by occurrence id (see
+  // exportAssemblyOccurrencesAsStep for why), so this is required for all items.
 
   try {
     const results = [];
@@ -454,38 +445,25 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const formatName = (item.formatName || "STEP").toUpperCase();
       const ext = FORMAT_EXTENSIONS[formatName] || "step";
 
-      if (item.isStatic && item.parts.length > 1) {
-        // Merging more than one part needs their real mated positions, which
-        // only the assembly translation endpoint knows - it needs the assembly
-        // context plus each part's occurrence id (not just its bare part id).
-        if (!assemblyContext || !assemblyContext.documentId) {
-          return res.status(400).json({
-            error: `"${item.name}" is a multi-part static export and needs the assembly's context to preserve how the parts are mated - try re-staging it from the assembly tab.`,
-          });
-        }
-        if (item.parts.some((p) => !p.occurrenceId)) {
-          return res.status(400).json({
-            error: `"${item.name}" is missing occurrence info for one of its parts - try re-staging it.`,
-          });
-        }
+      // Every export - single part or multi-part merge - needs the assembly
+      // context plus each part's occurrence id now (see exportAssemblyOccurrencesAsStep
+      // for why exporting from the part's own Part Studio doesn't work reliably).
+      if (!assemblyContext || !assemblyContext.documentId) {
+        return res.status(400).json({
+          error: `"${item.name}" needs the assembly's context to export - try re-opening the panel from the assembly tab.`,
+        });
+      }
+      if (item.parts.some((p) => !p.occurrenceId)) {
+        return res.status(400).json({
+          error: `"${item.name}" is missing occurrence info for one of its parts - try re-staging it.`,
+        });
       }
 
       const filename = `${item.name}.${ext}`;
       const targetPath = item.replaceTarget || (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
-      let buffer;
-      if (item.isStatic && item.parts.length > 1) {
-        // Multiple parts merged into one file - export from the assembly by
-        // occurrence id so they keep their actual mated positions instead of
-        // each landing at its own Part Studio's origin.
-        buffer = await exportAssemblyOccurrencesAsStep(req.session.onshapeAccessToken, assemblyContext, item.parts.map((p) => p.occurrenceId), formatName);
-      } else {
-        // Single part (static or not) - a lone part has no "relative position"
-        // to preserve, so exporting straight from its own Part Studio is fine.
-        const { sourceDocumentId, sourceMicroversion, sourceElementId, partId } = item.parts[0];
-        buffer = await exportPartsAsStep(req.session.onshapeAccessToken, sourceDocumentId, sourceMicroversion, sourceElementId, [partId], false, formatName);
-      }
+      const buffer = await exportAssemblyOccurrencesAsStep(req.session.onshapeAccessToken, assemblyContext, item.parts.map((p) => p.occurrenceId), formatName);
 
       if (existing) {
         if (item.archiveMode === "delete") {

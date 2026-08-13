@@ -463,23 +463,35 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       }
 
       const filename = `${item.name}.${ext}`;
-      const targetPath = item.replaceTarget || (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
+      // When replacing, only the FOLDER should carry over from the old file -
+      // the actual filename has to come from item.name/ext (what the user
+      // picked this time), otherwise the rename and format choice both get
+      // silently discarded and the old file just gets overwritten in place
+      // under its old name/extension with the newly-exported content.
+      const replaceFolder = item.replaceTarget && item.replaceTarget.includes("/")
+        ? item.replaceTarget.substring(0, item.replaceTarget.lastIndexOf("/"))
+        : "";
+      const targetPath = item.replaceTarget
+        ? (replaceFolder ? `${replaceFolder}/${filename}` : filename)
+        : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
       const buffer = await exportAssemblyOccurrencesAsStep(req.session.onshapeAccessToken, assemblyContext, item.parts.map((p) => p.occurrenceId), formatName);
 
       if (existing) {
+        // Archive/delete the OLD file at its own original path/name - never
+        // targetPath, which by this point is the NEW (possibly renamed) path.
+        const oldFilename = item.replaceTarget.includes("/") ? item.replaceTarget.substring(item.replaceTarget.lastIndexOf("/") + 1) : item.replaceTarget;
         if (item.archiveMode === "delete") {
-          await deleteFile(req, targetPath, `chore: delete ${filename} (replaced)`, existing.sha);
+          await deleteFile(req, item.replaceTarget, `chore: delete ${oldFilename} (replaced)`, existing.sha);
         } else {
-          const folder = targetPath.substring(0, targetPath.lastIndexOf("/"));
-          const oldFilename = targetPath.substring(targetPath.lastIndexOf("/") + 1);
+          const folder = replaceFolder;
           // Look for whatever "archive" folder already exists in this folder
           // (any casing) rather than always assuming one named exactly "Archive".
           const archiveFolderName = await findArchiveFolderName(req, folder);
           const archivePath = folder ? `${folder}/${archiveFolderName}/${oldFilename}` : `${archiveFolderName}/${oldFilename}`;
           await putFile(req, archivePath, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
-          await deleteFile(req, targetPath, `chore: remove old ${oldFilename} (archived)`, existing.sha);
+          await deleteFile(req, item.replaceTarget, `chore: remove old ${oldFilename} (archived)`, existing.sha);
         }
       }
 

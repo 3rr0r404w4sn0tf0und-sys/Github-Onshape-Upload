@@ -447,6 +447,77 @@ const collapsedPaths = new Set();
 let treeLoadedOnce = false;
 let draggingTreePath = null; // display path of the tree row currently being dragged (for move/reorganize)
 
+// ---------- Onshape-style horizontal nesting drag ----------
+// Instead of separate "drop on this exact spot" targets, hovering any row picks
+// a default target (the row's own folder - i.e. same level as what you're
+// hovering), and dragging sideways from where the drag STARTED walks up/down
+// the ancestor chain: drag right = one level deeper (only possible if you're
+// hovering an folder that's currently expanded), drag left = pull out to a
+// shallower folder, all the way out to the repo root.
+const NEST_STEP_PX = 18;
+let dragOriginX = null;
+let dragBadge = null;
+
+function ancestorFolders(path) {
+  // folder paths from root ("") up to (not including) path's own parent container
+  const parts = path.split("/").slice(0, -1);
+  const chain = [""];
+  let cur = "";
+  for (const p of parts) { cur = cur ? `${cur}/${p}` : p; chain.push(cur); }
+  return chain;
+}
+
+function computeDropTarget(entry, isFile, clientX) {
+  const chain = ancestorFolders(entry.__path);
+  const canNestInside = !isFile && !collapsedPaths.has(entry.__path); // only open folders are nest-able targets
+  const options = canNestInside ? [...chain, entry.__path] : chain;
+  const defaultIndex = chain.length - 1; // "same folder as the thing I'm hovering"
+  const steps = dragOriginX === null ? 0 : Math.round((clientX - dragOriginX) / NEST_STEP_PX);
+  const targetIndex = Math.max(0, Math.min(options.length - 1, defaultIndex + steps));
+  return { folder: options[targetIndex], isReplaceCandidate: isFile && steps === 0 };
+}
+
+function showDragBadge(text, x, y) {
+  if (!dragBadge) {
+    dragBadge = document.createElement("div");
+    dragBadge.style.cssText = "position:fixed; z-index:9999; background:#5865F2; color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; pointer-events:none; font-family:ui-monospace,monospace; white-space:nowrap;";
+    document.body.appendChild(dragBadge);
+  }
+  dragBadge.textContent = text;
+  dragBadge.style.left = (x + 10) + "px";
+  dragBadge.style.top = (y - 24) + "px";
+}
+function hideDragBadge() {
+  if (dragBadge) { dragBadge.remove(); dragBadge = null; }
+}
+document.addEventListener("dragend", () => { hideDragBadge(); dragOriginX = null; });
+
+// Shared drop-target binding used by every tree row (file or folder). Handles
+// both a staged file being dropped in, and an existing tree item being moved.
+function bindDropTarget(el, entry, isFile) {
+  el.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX);
+    el.classList.toggle("dragover", isReplaceCandidate);
+    showDragBadge(isReplaceCandidate ? `replace ${entry.__path.split("/").pop()}` : (folder === "" ? "→ repo root" : `→ ${folder}`), e.clientX, e.clientY);
+  });
+  el.addEventListener("dragleave", () => el.classList.remove("dragover"));
+  el.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove("dragover");
+    hideDragBadge();
+    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX);
+    if (e.dataTransfer.types.includes("application/x-tree-move")) {
+      handleTreeMoveDrop(folder, e); // moving an existing item never "replaces" - it always lands in the chosen folder
+      return;
+    }
+    const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
+    if (isReplaceCandidate) assignReplacement(stagedId, entry.__path, el);
+    else assignDestination(stagedId, folder);
+  });
+}
+
 function renderNode(node, depth, parentPath) {
   const wrap = document.createElement("div");
   for (const key of Object.keys(node).sort()) {
@@ -535,52 +606,15 @@ function renderNode(node, depth, parentPath) {
       // dragging THIS row to reorganize the tree
       inner.addEventListener("dragstart", (e) => {
         draggingTreePath = entry.__path;
+        dragOriginX = e.clientX;
         e.dataTransfer.setData("application/x-tree-move", entry.__path);
         e.stopPropagation();
       });
       inner.addEventListener("dragend", () => { draggingTreePath = null; });
     }
 
-    // drop target behavior
-    if (isFile) {
-      // Hovering the middle band of a file = replace it (archive/delete per that
-      // staged item's toggle). Hovering the top/bottom sliver = drop ABOVE/BELOW
-      // it instead - i.e. just add the staged file into the same folder as a
-      // sibling, no replace, no archiving. A dragged tree item (move) always just
-      // moves into this file's parent folder, regardless of vertical position -
-      // "replacing" a file with a moved file/folder isn't a supported move.
-      inner.addEventListener("dragover", (e) => {
-        e.preventDefault();
-        inner.classList.remove("dragover", "drop-before", "drop-after");
-        if (e.dataTransfer.types.includes("application/x-tree-move")) {
-          inner.classList.add("drop-before");
-          return;
-        }
-        const rect = inner.getBoundingClientRect();
-        const frac = (e.clientY - rect.top) / rect.height;
-        if (frac < 0.3) inner.classList.add("drop-before");
-        else if (frac > 0.7) inner.classList.add("drop-after");
-        else inner.classList.add("dragover");
-      });
-      inner.addEventListener("dragleave", () => inner.classList.remove("dragover", "drop-before", "drop-after"));
-      inner.addEventListener("drop", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const wasSibling = inner.classList.contains("drop-before") || inner.classList.contains("drop-after");
-        inner.classList.remove("dragover", "drop-before", "drop-after");
-        const parentPath = entry.__path.includes("/") ? entry.__path.substring(0, entry.__path.lastIndexOf("/")) : "";
-        if (e.dataTransfer.types.includes("application/x-tree-move")) {
-          handleTreeMoveDrop(parentPath, e); // moving a tree item onto a file always just moves it alongside, never "replaces"
-          return;
-        }
-        const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
-        if (wasSibling) assignDestination(stagedId, parentPath);
-        else assignReplacement(stagedId, entry.__path, inner);
-      });
-    } else {
-      // dropping onto a folder = add as new file there (no replacement), OR move a dragged tree item into it
-      bindFolderDropTarget(inner, entry);
-    }
+    // drop target behavior - same horizontal nesting logic for both files and folders
+    bindDropTarget(inner, entry, isFile);
 
     row.appendChild(inner);
     if (!isFile && !isCollapsed) {
@@ -714,6 +748,7 @@ function renderStage() {
       card.addEventListener("dragstart", (e) => {
         card.classList.add("dragging");
         draggingStagedId = item.id;
+        dragOriginX = e.clientX;
         e.dataTransfer.setData("application/x-staged-id", item.id);
         e.dataTransfer.setData("text/plain", item.id); // fallback for older drop targets
       });
@@ -864,7 +899,7 @@ uploadBtn.addEventListener("click", async () => {
       }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Commit failed");
+    if (!res.ok) throw new Error(data.detail ? `${data.error || "Commit failed"} — ${data.detail}` : (data.error || "Commit failed"));
     setStatus("Done:\n" + data.results.map((r) => `${r.path} — ${r.action}`).join("\n"));
     staged = [];
     pendingDeletes = [];

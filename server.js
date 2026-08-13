@@ -273,7 +273,29 @@ async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicrovers
     formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
   }, { headers });
 
-  const statusUrl = `https://cad.onshape.com/api/v6/translations/${job.id}`;
+  return downloadOnshapeTranslation(headers, job.id);
+}
+
+// Multi-part STATIC (merged) exports need to go through the ASSEMBLY's own
+// translation endpoint, not each part's Part Studio - a Part Studio export
+// only knows a part's position within its OWN Part Studio, not wherever the
+// assembly's mates ended up placing it. Translating from the assembly with
+// occurrence ids preserves the actual in-context (mated) transform, so merged
+// parts land assembled together instead of stacked at each part's own origin.
+async function exportAssemblyOccurrencesAsStep(onshapeToken, assemblyContext, occurrenceIds, formatName) {
+  const { documentId, workspaceOrVersion, workspaceOrVersionId, elementId } = assemblyContext;
+  const translateUrl = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
+  const headers = { Authorization: `Bearer ${onshapeToken}` };
+
+  const { data: job } = await axios.post(translateUrl, {
+    formatName: formatName || "STEP", partIds: occurrenceIds.join(","), onePartPerDoc: false, storeInDocument: false,
+  }, { headers });
+
+  return downloadOnshapeTranslation(headers, job.id);
+}
+
+async function downloadOnshapeTranslation(headers, jobId) {
+  const statusUrl = `https://cad.onshape.com/api/v6/translations/${jobId}`;
   let result;
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 2000));
@@ -386,11 +408,12 @@ const FORMAT_EXTENSIONS = {
 
 app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
-  const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [] } = req.body;
-  // NOTE: no top-level documentId/workspaceId needed anymore - each staged
-  // part already carries its own sourceDocumentId/sourceMicroversion/
-  // sourceElementId, which is what actually determines where a translation
-  // call goes (see /api/parts for why we pin to microversion, not workspace).
+  const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [], assemblyContext = null } = req.body;
+  // assemblyContext (documentId/workspaceOrVersion/workspaceOrVersionId/elementId)
+  // is the ASSEMBLY tab the panel is currently open on. Individual part exports
+  // don't need it (they export straight from each part's own Part Studio via
+  // sourceDocumentId/sourceMicroversion/sourceElementId), but multi-part STATIC
+  // exports do - see exportAssemblyOccurrencesAsStep.
 
   try {
     const results = [];
@@ -431,15 +454,18 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const formatName = (item.formatName || "STEP").toUpperCase();
       const ext = FORMAT_EXTENSIONS[formatName] || "step";
 
-      if (item.isStatic) {
-        // A single translation call can only merge parts that live in the
-        // SAME source Part Studio element - group by document+element, not
-        // just element id, since two different documents could coincidentally
-        // reuse the same element id.
-        const distinctSources = new Set(item.parts.map((p) => `${p.sourceDocumentId}:${p.sourceElementId}`));
-        if (distinctSources.size > 1) {
+      if (item.isStatic && item.parts.length > 1) {
+        // Merging more than one part needs their real mated positions, which
+        // only the assembly translation endpoint knows - it needs the assembly
+        // context plus each part's occurrence id (not just its bare part id).
+        if (!assemblyContext || !assemblyContext.documentId) {
           return res.status(400).json({
-            error: `"${item.name}" can't be a single static export - its selected parts come from ${distinctSources.size} different Part Studio tabs. Onshape can only merge parts into one file if they're in the same Part Studio. Split this into separate static groups per source tab, or uncheck Static and export them individually.`,
+            error: `"${item.name}" is a multi-part static export and needs the assembly's context to preserve how the parts are mated - try re-staging it from the assembly tab.`,
+          });
+        }
+        if (item.parts.some((p) => !p.occurrenceId)) {
+          return res.status(400).json({
+            error: `"${item.name}" is missing occurrence info for one of its parts - try re-staging it.`,
           });
         }
       }
@@ -449,10 +475,14 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
       let buffer;
-      if (item.isStatic) {
-        const { sourceDocumentId, sourceMicroversion, sourceElementId } = item.parts[0];
-        buffer = await exportPartsAsStep(req.session.onshapeAccessToken, sourceDocumentId, sourceMicroversion, sourceElementId, item.parts.map((p) => p.partId), true, formatName);
+      if (item.isStatic && item.parts.length > 1) {
+        // Multiple parts merged into one file - export from the assembly by
+        // occurrence id so they keep their actual mated positions instead of
+        // each landing at its own Part Studio's origin.
+        buffer = await exportAssemblyOccurrencesAsStep(req.session.onshapeAccessToken, assemblyContext, item.parts.map((p) => p.occurrenceId), formatName);
       } else {
+        // Single part (static or not) - a lone part has no "relative position"
+        // to preserve, so exporting straight from its own Part Studio is fine.
         const { sourceDocumentId, sourceMicroversion, sourceElementId, partId } = item.parts[0];
         buffer = await exportPartsAsStep(req.session.onshapeAccessToken, sourceDocumentId, sourceMicroversion, sourceElementId, [partId], false, formatName);
       }
@@ -478,8 +508,15 @@ app.post("/api/commit", requireAuth, async (req, res) => {
 
     res.json({ success: true, results });
   } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Commit failed", detail: err.message });
+    const failedUrl = err.config ? `${(err.config.method || "?").toUpperCase()} ${err.config.url}` : null;
+    const upstreamBody = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : null;
+    console.error(failedUrl, err.response?.status, upstreamBody || err.message);
+    res.status(500).json({
+      error: "Commit failed",
+      detail: failedUrl
+        ? `${failedUrl} → ${err.response?.status}${upstreamBody ? " " + upstreamBody : ""}`
+        : err.message,
+    });
   }
 });
 

@@ -450,7 +450,7 @@ let draggingTreePath = null; // display path of the tree row currently being dra
 // the ancestor chain: drag right = one level deeper (only possible if you're
 // hovering an folder that's currently expanded), drag left = pull out to a
 // shallower folder, all the way out to the repo root.
-const NEST_STEP_PX = 18;
+const INDENT_PX = 14; // must match .tree-node padding-left in panel.html
 let dragBadge = null;
 
 function ancestorFolders(path) {
@@ -462,17 +462,22 @@ function ancestorFolders(path) {
   return chain;
 }
 
-function computeDropTarget(entry, isFile, clientX, rowLeft) {
+function computeDropTarget(entry, isFile, clientX, iconLeft) {
   const chain = ancestorFolders(entry.__path);
   const canNestInside = !isFile && !collapsedPaths.has(entry.__path); // only open folders are nest-able targets
   const options = canNestInside ? [...chain, entry.__path] : chain;
-  const defaultIndex = chain.length - 1; // "same folder as the thing I'm hovering"
-  // Anchored per-hovered-row (not per-drag-start): hovering a row's own icon
-  // is the sibling-level baseline (steps=0), regardless of where the drag began
-  // or which path the pointer took to get here.
-  const steps = rowLeft == null ? 0 : Math.round((clientX - rowLeft) / NEST_STEP_PX);
-  const targetIndex = Math.max(0, Math.min(options.length - 1, defaultIndex + steps));
-  return { folder: options[targetIndex], isReplaceCandidate: isFile && steps === 0, targetPath: options[targetIndex] };
+  const defaultIndex = chain.length - 1; // "same folder as the thing I'm hovering" - this IS this row's real screen depth
+  // iconLeft is this row's actual on-screen icon x, which sits at screen-depth
+  // defaultIndex (rows are really nested in the DOM, so depth <-> x is exact).
+  // Back that out to an absolute depth-0/root x origin so the target depth is
+  // driven purely by the cursor's absolute position - NOT by whichever row
+  // happens to be underneath it. Without this, the "steps=0" anchor jumps
+  // every time the pointer crosses onto a shallower/deeper row mid-drag, which
+  // is what made targeting feel random.
+  const originX = iconLeft == null ? null : iconLeft - defaultIndex * INDENT_PX;
+  const targetDepth = originX == null ? defaultIndex : Math.round((clientX - originX) / INDENT_PX);
+  const targetIndex = Math.max(0, Math.min(options.length - 1, targetDepth));
+  return { folder: options[targetIndex], isReplaceCandidate: isFile && targetIndex === defaultIndex, targetPath: options[targetIndex] };
 }
 
 function showDragBadge(text, x, y) {
@@ -511,8 +516,9 @@ document.addEventListener("dragend", () => { hideDragBadge(); clearTargetLineHig
 function bindDropTarget(el, entry, isFile) {
   el.addEventListener("dragover", (e) => {
     e.preventDefault();
-    const rowLeft = el.getBoundingClientRect().left;
-    const { folder, isReplaceCandidate, targetPath } = computeDropTarget(entry, isFile, e.clientX, rowLeft);
+    const iconEl = el.querySelector(".tree-icon");
+    const iconLeft = (iconEl || el).getBoundingClientRect().left;
+    const { folder, isReplaceCandidate, targetPath } = computeDropTarget(entry, isFile, e.clientX, iconLeft);
     el.classList.toggle("dragover", isReplaceCandidate);
     setTargetLineHighlight(isReplaceCandidate ? null : targetPath);
     showDragBadge(isReplaceCandidate ? `replace ${entry.__path.split("/").pop()}` : (folder === "" ? "→ repo root" : `→ ${folder}`), e.clientX, e.clientY);
@@ -524,8 +530,9 @@ function bindDropTarget(el, entry, isFile) {
     el.classList.remove("dragover");
     hideDragBadge();
     clearTargetLineHighlight();
-    const rowLeft = el.getBoundingClientRect().left;
-    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX, rowLeft);
+    const iconEl = el.querySelector(".tree-icon");
+    const iconLeft = (iconEl || el).getBoundingClientRect().left;
+    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX, iconLeft);
     if (e.dataTransfer.types.includes("application/x-tree-move")) {
       handleTreeMoveDrop(folder, e); // moving an existing item never "replaces" - it always lands in the chosen folder
       return;

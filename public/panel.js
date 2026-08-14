@@ -451,7 +451,6 @@ let draggingTreePath = null; // display path of the tree row currently being dra
 // hovering an folder that's currently expanded), drag left = pull out to a
 // shallower folder, all the way out to the repo root.
 const NEST_STEP_PX = 18;
-let dragOriginX = null;
 let dragBadge = null;
 
 function ancestorFolders(path) {
@@ -463,38 +462,59 @@ function ancestorFolders(path) {
   return chain;
 }
 
-function computeDropTarget(entry, isFile, clientX) {
+function computeDropTarget(entry, isFile, clientX, rowLeft) {
   const chain = ancestorFolders(entry.__path);
   const canNestInside = !isFile && !collapsedPaths.has(entry.__path); // only open folders are nest-able targets
   const options = canNestInside ? [...chain, entry.__path] : chain;
   const defaultIndex = chain.length - 1; // "same folder as the thing I'm hovering"
-  const steps = dragOriginX === null ? 0 : Math.round((clientX - dragOriginX) / NEST_STEP_PX);
+  // Anchored per-hovered-row (not per-drag-start): hovering a row's own icon
+  // is the sibling-level baseline (steps=0), regardless of where the drag began
+  // or which path the pointer took to get here.
+  const steps = rowLeft == null ? 0 : Math.round((clientX - rowLeft) / NEST_STEP_PX);
   const targetIndex = Math.max(0, Math.min(options.length - 1, defaultIndex + steps));
-  return { folder: options[targetIndex], isReplaceCandidate: isFile && steps === 0 };
+  return { folder: options[targetIndex], isReplaceCandidate: isFile && steps === 0, targetPath: options[targetIndex] };
 }
 
 function showDragBadge(text, x, y) {
-  if (!dragBadge) {
-    dragBadge = document.createElement("div");
-    dragBadge.style.cssText = "position:fixed; z-index:9999; background:#5865F2; color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; pointer-events:none; font-family:ui-monospace,monospace; white-space:nowrap;";
-    document.body.appendChild(dragBadge);
-  }
+  if (!dragBadge) dragBadge = document.getElementById("dragHint");
+  if (!dragBadge) return;
   dragBadge.textContent = text;
   dragBadge.style.left = (x + 10) + "px";
   dragBadge.style.top = (y - 24) + "px";
+  dragBadge.style.display = "block";
 }
 function hideDragBadge() {
-  if (dragBadge) { dragBadge.remove(); dragBadge = null; }
+  if (dragBadge) dragBadge.style.display = "none";
 }
-document.addEventListener("dragend", () => { hideDragBadge(); dragOriginX = null; });
+
+// Highlights the .tree-line of the ancestor folder currently targeted by a
+// drag, so the user gets live visual feedback on where a drop will land.
+let highlightedTargetPath = null;
+function setTargetLineHighlight(path) {
+  if (path === highlightedTargetPath) return;
+  if (highlightedTargetPath !== null) {
+    const prevRow = document.querySelector(`.row[data-path="${CSS.escape(highlightedTargetPath)}"]`);
+    prevRow?.parentElement?.querySelector(".tree-line")?.classList.remove("target-line");
+  }
+  highlightedTargetPath = path;
+  if (path) {
+    const row = document.querySelector(`.row[data-path="${CSS.escape(path)}"]`);
+    row?.parentElement?.querySelector(".tree-line")?.classList.add("target-line");
+  }
+}
+function clearTargetLineHighlight() { setTargetLineHighlight(null); }
+
+document.addEventListener("dragend", () => { hideDragBadge(); clearTargetLineHighlight(); });
 
 // Shared drop-target binding used by every tree row (file or folder). Handles
 // both a staged file being dropped in, and an existing tree item being moved.
 function bindDropTarget(el, entry, isFile) {
   el.addEventListener("dragover", (e) => {
     e.preventDefault();
-    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX);
+    const rowLeft = el.getBoundingClientRect().left;
+    const { folder, isReplaceCandidate, targetPath } = computeDropTarget(entry, isFile, e.clientX, rowLeft);
     el.classList.toggle("dragover", isReplaceCandidate);
+    setTargetLineHighlight(isReplaceCandidate ? null : targetPath);
     showDragBadge(isReplaceCandidate ? `replace ${entry.__path.split("/").pop()}` : (folder === "" ? "→ repo root" : `→ ${folder}`), e.clientX, e.clientY);
   });
   el.addEventListener("dragleave", () => el.classList.remove("dragover"));
@@ -503,7 +523,9 @@ function bindDropTarget(el, entry, isFile) {
     e.stopPropagation();
     el.classList.remove("dragover");
     hideDragBadge();
-    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX);
+    clearTargetLineHighlight();
+    const rowLeft = el.getBoundingClientRect().left;
+    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX, rowLeft);
     if (e.dataTransfer.types.includes("application/x-tree-move")) {
       handleTreeMoveDrop(folder, e); // moving an existing item never "replaces" - it always lands in the chosen folder
       return;
@@ -602,7 +624,6 @@ function renderNode(node, depth, parentPath) {
       // dragging THIS row to reorganize the tree
       inner.addEventListener("dragstart", (e) => {
         draggingTreePath = entry.__path;
-        dragOriginX = e.clientX;
         e.dataTransfer.setData("application/x-tree-move", entry.__path);
         e.stopPropagation();
       });
@@ -744,7 +765,6 @@ function renderStage() {
       card.addEventListener("dragstart", (e) => {
         card.classList.add("dragging");
         draggingStagedId = item.id;
-        dragOriginX = e.clientX;
         e.dataTransfer.setData("application/x-staged-id", item.id);
         e.dataTransfer.setData("text/plain", item.id); // fallback for older drop targets
       });

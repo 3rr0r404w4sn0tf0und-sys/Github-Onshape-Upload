@@ -50,9 +50,11 @@
 
   .tree-node { padding-left:14px; position:relative; font-family: ui-monospace, monospace; font-size:11px; }
   .tree-line { position:absolute; left:5px; top:0; bottom:0; width:1px; background:#444; }
+  .tree-line.target-line { width:2px; background:#5865F2; }
   .row { display:flex; align-items:center; justify-content:space-between; padding:2px 4px; border-radius:4px; cursor:grab; }
   .row.folder { font-weight:600; }
   .row.dragover { background:#5865F2 !important; }
+  #dragHint { display:none; position:fixed; z-index:9999; background:#5865F2; color:#fff; font-size:10px; padding:2px 6px; border-radius:4px; pointer-events:none; font-family:ui-monospace,monospace; white-space:nowrap; }
   .row.flying-away { transform: translateX(30px) scale(0.85); opacity:0; transition: all 0.35s ease; }
   .row.pending-new { color:#7ee787; }
   .row.pending-new .tree-icon { color:#7ee787; }
@@ -91,6 +93,7 @@
 </style>
 </head>
 <body>
+<div id="dragHint"></div>
 
 <div id="loginView">
   <div style="font-size:13px; opacity:0.8;">Connect both accounts to get started</div>

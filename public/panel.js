@@ -179,7 +179,7 @@ const stagePane = document.getElementById("stagePane");
 const staticCheck = document.getElementById("staticCheck");
 const deleteInsteadCheck = document.getElementById("deleteInsteadCheck");
 const formatSelect = document.getElementById("formatSelect");
-let partsById = {}; // occurrence id -> full part info (name, partId, sourceElementId)
+let partsById = {}; // partId -> part info (name, partId) from the current Part Studio
 const uploadBtn = document.getElementById("uploadBtn");
 const statusEl = document.getElementById("status");
 const undoBtn = document.getElementById("undoBtn");
@@ -251,7 +251,7 @@ async function loadParts() {
     partsById = {};
     data.parts.forEach((p) => { partsById[p.id] = p; });
     if (!data.parts.length) {
-      partSelect.innerHTML = `<option disabled>No parts found - is this an Assembly tab?</option>`;
+      partSelect.innerHTML = `<option disabled>No parts found - is this a Part Studio tab?</option>`;
       return;
     }
     partSelect.innerHTML = data.parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
@@ -280,11 +280,7 @@ stageBtn.addEventListener("click", () => {
     const info = partsById[opt.value];
     staged.push({
       id: crypto.randomUUID(),
-      occurrenceId: opt.value,
-      partId: info.partId,
-      sourceDocumentId: info.sourceDocumentId,   // which document this part actually lives in
-      sourceElementId: info.sourceElementId,     // which Part Studio tab within that document
-      sourceMicroversion: info.sourceMicroversion, // exact snapshot the assembly references
+      partId: info.partId, // every staged part comes from THIS Part Studio (ctx) - no per-part source tracking needed anymore
       partName: opt.textContent,
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
@@ -859,13 +855,7 @@ uploadBtn.addEventListener("click", async () => {
 
   const formatName = formatSelect.value;
 
-  const partRef = (s) => ({
-    sourceDocumentId: s.sourceDocumentId,
-    sourceElementId: s.sourceElementId,
-    sourceMicroversion: s.sourceMicroversion,
-    partId: s.partId,
-    occurrenceId: s.occurrenceId, // kept for reference/future use - server exports per-part via Part Studio now, not by occurrence
-  });
+  const partRef = (s) => ({ partId: s.partId }); // every part comes from `ctx` (the open Part Studio), sent once below - not per-part anymore
 
   const items = staticCheck.checked
     ? [{
@@ -897,7 +887,7 @@ uploadBtn.addEventListener("click", async () => {
         folderCreates: pendingFolderCreates,
         renames: renamesArr,
         items,
-        assemblyContext: ctx, // unused server-side currently, kept in case a future export path needs it
+        context: ctx, // documentId/workspaceOrVersion/workspaceOrVersionId/elementId of the Part Studio this panel is open on - every export comes from here
       }),
     });
     const data = await res.json();

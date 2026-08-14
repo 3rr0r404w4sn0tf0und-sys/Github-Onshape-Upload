@@ -286,11 +286,30 @@ async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicrovers
   const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${sourceDocumentId}/m/${sourceMicroversion}/e/${sourceElementId}/translations`;
   const headers = { Authorization: `Bearer ${onshapeToken}` };
 
-  const { data: job } = await axios.post(translateUrl, {
-    formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
-  }, { headers });
+  try {
+    const { data: job } = await axios.post(translateUrl, {
+      formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
+    }, { headers });
 
-  return downloadOnshapeTranslation(headers, sourceDocumentId, job.id);
+    return await downloadOnshapeTranslation(headers, sourceDocumentId, job.id);
+  } catch (err) {
+    if (err.response?.status === 404) {
+      // A 404 here means sourceElementId isn't a real Part Studio - the part
+      // is authored directly inside the assembly (an "in-context"/composite
+      // part), which Onshape's API has no filtered-export path for at all:
+      // the assembly translation endpoint exists, but (confirmed against
+      // Onshape's own forum) it ignores partIds entirely and always exports
+      // the whole assembly - there's no endpoint that does both at once.
+      const notFoundErr = new Error(
+        "This part isn't in its own Part Studio - it looks like it was created directly inside the assembly (an in-context/composite part). " +
+        "Onshape's API can only selectively export parts that live in a Part Studio, so this one can't be exported on its own through this tool. " +
+        "In Onshape, try right-click → \"Insert into new Part Studio\" (or similar) on that part to move it into its own Part Studio first, then re-stage it."
+      );
+      notFoundErr.isKnownLimitation = true;
+      throw notFoundErr;
+    }
+    throw err;
+  }
 }
 
 async function downloadOnshapeTranslation(headers, documentId, jobId) {
@@ -517,6 +536,10 @@ app.post("/api/commit", requireAuth, async (req, res) => {
 
     res.json({ success: true, results });
   } catch (err) {
+    if (err.isKnownLimitation) {
+      console.error(err.message);
+      return res.status(400).json({ error: err.message });
+    }
     const failedUrl = err.config ? `${(err.config.method || "?").toUpperCase()} ${err.config.url}` : null;
     let upstreamBody = null;
     if (err.response?.data) {

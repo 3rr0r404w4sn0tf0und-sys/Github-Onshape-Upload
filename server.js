@@ -232,32 +232,32 @@ app.get("/api/parts", requireAuth, async (req, res) => {
     // live workspace or a frozen version - Onshape's generic element path
     // pattern is /d/{did}/{w|v}/{wvid}/e/{eid}, so we build it dynamically
     // rather than assuming "w".
-    const url = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}?includeMateFeatures=false`;
+    //
+    // This app is a Part Studio tool (not an assembly tool): every part
+    // listed here, and every export, comes from THIS Part Studio tab.
+    // That's a deliberate simplification, not an oversight - see the big
+    // comment above exportPartsAsStep for why: Onshape's public API has no
+    // way to selectively export a specific part from an assembly (the
+    // assembly translation endpoint ignores any part filter and always
+    // exports everything), so trying to be an "assembly tool" meant either
+    // silently over-exporting or hitting parts that live directly in the
+    // assembly with no Part Studio to export from at all. Scoping to a
+    // single Part Studio sidesteps all of that.
+    const url = `https://cad.onshape.com/api/v6/parts/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}`;
     const { data } = await axios.get(url, {
       headers: { Authorization: `Bearer ${req.session.onshapeAccessToken}` },
     });
 
-    // Per Onshape's documented getAssemblyDefinition response shape, each
-    // instance carries: id, partId, name, documentId, elementId, and
-    // documentMicroversion - there is NO workspaceId on the instance itself.
-    // We pin exports to documentMicroversion rather than guessing a workspace,
-    // since that's the exact snapshot the assembly actually references and
-    // it's correct even for parts inserted from a different document.
-    const parts = (data.rootAssembly?.instances || [])
-      .filter((inst) => inst.type === "Part")
-      .map((inst) => ({
-        id: inst.id,                                   // occurrence id within the assembly
-        name: inst.name,
-        partId: inst.partId,                            // the underlying part's own id
-        sourceDocumentId: inst.documentId,
-        sourceElementId: inst.elementId,                 // the Part Studio this part actually lives in
-        sourceMicroversion: inst.documentMicroversion,   // exact snapshot to export from
-      }));
+    const parts = (data || []).map((p) => ({
+      id: p.partId,
+      name: p.name,
+      partId: p.partId,
+    }));
 
     res.json({ parts });
   } catch (err) {
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Failed to fetch assembly parts from Onshape" });
+    res.status(500).json({ error: "Failed to fetch parts from this Part Studio" });
   }
 });
 
@@ -274,16 +274,13 @@ app.get("/api/parts", requireAuth, async (req, res) => {
 // respect a selection AND preserve mated positions. It does neither.
 //
 // The only endpoint that actually supports selecting specific parts is the Part
-// Studio translation endpoint, keyed to each part's OWN source Part Studio. The
-// real tradeoff: that gives correct, exact selection, but a merged/static export
-// can only correctly combine parts that live in the SAME Part Studio (their
-// relative position there is well-defined) - it cannot reconstruct how separate
-// Part Studios' parts were positioned by assembly mates, since Onshape's public
-// API has no single call that both selects specific parts AND resolves
-// cross-Part-Studio mate transforms. See findArchiveFolderName's sibling comment
-// in /api/commit for how merges are restricted accordingly.
-async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicroversion, sourceElementId, partIds, merged, formatName) {
-  const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${sourceDocumentId}/m/${sourceMicroversion}/e/${sourceElementId}/translations`;
+// Studio translation endpoint. Since this app now only ever works against a
+// single, currently-open Part Studio (see /api/parts), every export just uses
+// that same live workspace/version context directly - no more per-part
+// document/microversion pinning, and no more "different Part Studio" merge
+// restriction, since everything staged always comes from the one open tab.
+async function exportPartsAsStep(onshapeToken, documentId, workspaceOrVersion, workspaceOrVersionId, elementId, partIds, merged, formatName) {
+  const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
   const headers = { Authorization: `Bearer ${onshapeToken}` };
 
   try {
@@ -291,19 +288,11 @@ async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicrovers
       formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
     }, { headers });
 
-    return await downloadOnshapeTranslation(headers, sourceDocumentId, job.id);
+    return await downloadOnshapeTranslation(headers, documentId, job.id);
   } catch (err) {
     if (err.response?.status === 404) {
-      // A 404 here means sourceElementId isn't a real Part Studio - the part
-      // is authored directly inside the assembly (an "in-context"/composite
-      // part), which Onshape's API has no filtered-export path for at all:
-      // the assembly translation endpoint exists, but (confirmed against
-      // Onshape's own forum) it ignores partIds entirely and always exports
-      // the whole assembly - there's no endpoint that does both at once.
       const notFoundErr = new Error(
-        "This part isn't in its own Part Studio - it looks like it was created directly inside the assembly (an in-context/composite part). " +
-        "Onshape's API can only selectively export parts that live in a Part Studio, so this one can't be exported on its own through this tool. " +
-        "In Onshape, try right-click → \"Insert into new Part Studio\" (or similar) on that part to move it into its own Part Studio first, then re-stage it."
+        "Onshape couldn't find this Part Studio to export from - the panel may be stale. Try closing and reopening it from the Part Studio tab."
       );
       notFoundErr.isKnownLimitation = true;
       throw notFoundErr;
@@ -311,6 +300,7 @@ async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicrovers
     throw err;
   }
 }
+
 
 async function downloadOnshapeTranslation(headers, documentId, jobId) {
   const statusUrl = `https://cad.onshape.com/api/v6/translations/${jobId}`;
@@ -429,12 +419,16 @@ const FORMAT_EXTENSIONS = {
 app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
   const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [] } = req.body;
-  // Exports go straight from each part's own Part Studio (sourceDocumentId/
-  // sourceMicroversion/sourceElementId, captured when it was staged) - see the
-  // big comment above exportPartsAsStep for why the assembly context isn't
-  // usable for this despite seeming like the more natural place to export from.
+  // Every part staged in this app comes from the SAME currently-open Part
+  // Studio - `context` (documentId/workspaceOrVersion/workspaceOrVersionId/
+  // elementId) is that Part Studio, sent by the panel alongside the items.
+  const { context = null } = req.body;
 
   try {
+    if (items.length && (!context || !context.documentId)) {
+      return res.status(400).json({ error: "Missing Part Studio context - try reopening the panel from its tab." });
+    }
+
     const results = [];
 
     // Renames/moves and folder deletes queued while the user was working in
@@ -473,21 +467,6 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const formatName = (item.formatName || "STEP").toUpperCase();
       const ext = FORMAT_EXTENSIONS[formatName] || "step";
 
-      // A single translation call can only merge parts that live in the SAME
-      // source Part Studio - Onshape's API has no reliable way to select
-      // specific parts AND resolve cross-Part-Studio assembly-mate positions
-      // in one call (see the big comment above exportPartsAsStep). Group by
-      // document+element, not just element id, since two different documents
-      // could coincidentally reuse the same element id.
-      if (item.isStatic && item.parts.length > 1) {
-        const distinctSources = new Set(item.parts.map((p) => `${p.sourceDocumentId}:${p.sourceElementId}`));
-        if (distinctSources.size > 1) {
-          return res.status(400).json({
-            error: `"${item.name}" can't be a single static export - its selected parts come from ${distinctSources.size} different Part Studio tabs, and Onshape's API can't merge those into one file while preserving how they're mated. Split this into separate static groups per source tab, or uncheck Static and export them individually.`,
-          });
-        }
-      }
-
       const filename = `${item.name}.${ext}`;
       // When replacing, only the FOLDER should carry over from the old file -
       // the actual filename has to come from item.name/ext (what the user
@@ -502,12 +481,12 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
-      const { sourceDocumentId, sourceMicroversion, sourceElementId } = item.parts[0];
       const buffer = await exportPartsAsStep(
         req.session.onshapeAccessToken,
-        sourceDocumentId,
-        sourceMicroversion,
-        sourceElementId,
+        context.documentId,
+        context.workspaceOrVersion,
+        context.workspaceOrVersionId,
+        context.elementId,
         item.parts.map((p) => p.partId),
         item.isStatic && item.parts.length > 1,
         formatName,

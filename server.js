@@ -265,25 +265,32 @@ app.get("/api/parts", requireAuth, async (req, res) => {
 // Now uses the signed-in user's own Onshape OAuth token, so exports run
 // against whatever documents THEY have access to, not a shared dev account.
 
-// Every export - single part or multi-part static merge - now goes through
-// the ASSEMBLY's own translation endpoint, referencing occurrence ids, rather
-// than each part's underlying Part Studio. Two reasons: (1) a part occurrence
-// in an assembly doesn't necessarily even come from a Part Studio - it can be
-// a composite/derived part living in another assembly, and Onshape's
-// partstudios/.../translations endpoint 404s outright for those; (2) even for
-// plain Part Studio parts, the assembly endpoint is what actually knows where
-// mates put a part, which is what makes multi-part merges land assembled
-// instead of stacked at each part's own local origin.
-async function exportAssemblyOccurrencesAsStep(onshapeToken, assemblyContext, occurrenceIds, formatName) {
-  const { documentId, workspaceOrVersion, workspaceOrVersionId, elementId } = assemblyContext;
-  const translateUrl = `https://cad.onshape.com/api/v6/assemblies/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
+// IMPORTANT: Onshape's assembly translation endpoint (/assemblies/.../translations)
+// does NOT support filtering by part - confirmed against Onshape's own forum: the
+// "partIds" field is a Part Studio translation feature only, and passing it to the
+// assembly endpoint is silently ignored, always exporting the ENTIRE assembly. That
+// was the actual cause of "I selected one part and it exported the whole drone" - an
+// earlier version of this file used that endpoint on the (wrong) assumption it would
+// respect a selection AND preserve mated positions. It does neither.
+//
+// The only endpoint that actually supports selecting specific parts is the Part
+// Studio translation endpoint, keyed to each part's OWN source Part Studio. The
+// real tradeoff: that gives correct, exact selection, but a merged/static export
+// can only correctly combine parts that live in the SAME Part Studio (their
+// relative position there is well-defined) - it cannot reconstruct how separate
+// Part Studios' parts were positioned by assembly mates, since Onshape's public
+// API has no single call that both selects specific parts AND resolves
+// cross-Part-Studio mate transforms. See findArchiveFolderName's sibling comment
+// in /api/commit for how merges are restricted accordingly.
+async function exportPartsAsStep(onshapeToken, sourceDocumentId, sourceMicroversion, sourceElementId, partIds, merged, formatName) {
+  const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${sourceDocumentId}/m/${sourceMicroversion}/e/${sourceElementId}/translations`;
   const headers = { Authorization: `Bearer ${onshapeToken}` };
 
   const { data: job } = await axios.post(translateUrl, {
-    formatName: formatName || "STEP", partIds: occurrenceIds.join(","), onePartPerDoc: false, storeInDocument: false,
+    formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
   }, { headers });
 
-  return downloadOnshapeTranslation(headers, documentId, job.id);
+  return downloadOnshapeTranslation(headers, sourceDocumentId, job.id);
 }
 
 async function downloadOnshapeTranslation(headers, documentId, jobId) {
@@ -297,9 +304,8 @@ async function downloadOnshapeTranslation(headers, documentId, jobId) {
   }
   if (!result) throw new Error("Onshape translation timed out");
 
-  // NOTE: the download endpoint is scoped under the owning document
-  // (/documents/d/{documentId}/externaldata/{fid}), NOT a bare
-  // /externaldata/{fid} - that was the source of the earlier 404.
+  // The download endpoint is scoped under the owning document
+  // (/documents/d/{documentId}/externaldata/{fid}), NOT a bare /externaldata/{fid}.
   const fileId = result.resultExternalDataIds[0];
   const downloadUrl = `https://cad.onshape.com/api/v6/documents/d/${documentId}/externaldata/${fileId}`;
   const { data: fileBuffer } = await axios.get(downloadUrl, { responseType: "arraybuffer", headers });
@@ -403,11 +409,11 @@ const FORMAT_EXTENSIONS = {
 
 app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
-  const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [], assemblyContext = null } = req.body;
-  // assemblyContext (documentId/workspaceOrVersion/workspaceOrVersionId/elementId)
-  // is the assembly tab this panel is open on - every export now goes through
-  // that assembly's translation endpoint by occurrence id (see
-  // exportAssemblyOccurrencesAsStep for why), so this is required for all items.
+  const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [] } = req.body;
+  // Exports go straight from each part's own Part Studio (sourceDocumentId/
+  // sourceMicroversion/sourceElementId, captured when it was staged) - see the
+  // big comment above exportPartsAsStep for why the assembly context isn't
+  // usable for this despite seeming like the more natural place to export from.
 
   try {
     const results = [];
@@ -448,18 +454,19 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const formatName = (item.formatName || "STEP").toUpperCase();
       const ext = FORMAT_EXTENSIONS[formatName] || "step";
 
-      // Every export - single part or multi-part merge - needs the assembly
-      // context plus each part's occurrence id now (see exportAssemblyOccurrencesAsStep
-      // for why exporting from the part's own Part Studio doesn't work reliably).
-      if (!assemblyContext || !assemblyContext.documentId) {
-        return res.status(400).json({
-          error: `"${item.name}" needs the assembly's context to export - try re-opening the panel from the assembly tab.`,
-        });
-      }
-      if (item.parts.some((p) => !p.occurrenceId)) {
-        return res.status(400).json({
-          error: `"${item.name}" is missing occurrence info for one of its parts - try re-staging it.`,
-        });
+      // A single translation call can only merge parts that live in the SAME
+      // source Part Studio - Onshape's API has no reliable way to select
+      // specific parts AND resolve cross-Part-Studio assembly-mate positions
+      // in one call (see the big comment above exportPartsAsStep). Group by
+      // document+element, not just element id, since two different documents
+      // could coincidentally reuse the same element id.
+      if (item.isStatic && item.parts.length > 1) {
+        const distinctSources = new Set(item.parts.map((p) => `${p.sourceDocumentId}:${p.sourceElementId}`));
+        if (distinctSources.size > 1) {
+          return res.status(400).json({
+            error: `"${item.name}" can't be a single static export - its selected parts come from ${distinctSources.size} different Part Studio tabs, and Onshape's API can't merge those into one file while preserving how they're mated. Split this into separate static groups per source tab, or uncheck Static and export them individually.`,
+          });
+        }
       }
 
       const filename = `${item.name}.${ext}`;
@@ -476,7 +483,16 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
       const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
-      const buffer = await exportAssemblyOccurrencesAsStep(req.session.onshapeAccessToken, assemblyContext, item.parts.map((p) => p.occurrenceId), formatName);
+      const { sourceDocumentId, sourceMicroversion, sourceElementId } = item.parts[0];
+      const buffer = await exportPartsAsStep(
+        req.session.onshapeAccessToken,
+        sourceDocumentId,
+        sourceMicroversion,
+        sourceElementId,
+        item.parts.map((p) => p.partId),
+        item.isStatic && item.parts.length > 1,
+        formatName,
+      );
 
       if (existing) {
         // Archive/delete the OLD file at its own original path/name - never

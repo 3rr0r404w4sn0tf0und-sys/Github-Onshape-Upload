@@ -4,6 +4,7 @@ const ctx = {
   workspaceOrVersion: params.get("workspaceOrVersion"), // "w" or "v"
   workspaceOrVersionId: params.get("workspaceOrVersionId"),
   elementId: params.get("elementId"),
+  server: params.get("server"), // origin Onshape posts messages from - required to send/receive Client Messaging postMessages
 };
 
 const loginView = document.getElementById("loginView");
@@ -32,7 +33,7 @@ function attachCustomScroll(el) {
   el.addEventListener("wheel", (e) => {
     // lower scroll sensitivity - dampen the delta instead of the browser default jump
     e.preventDefault();
-    el.scrollTop += e.deltaY * 0.45;
+    el.scrollTop += e.deltaY * 0.18;
   }, { passive: false });
 }
 
@@ -180,6 +181,8 @@ const staticCheck = document.getElementById("staticCheck");
 const deleteInsteadCheck = document.getElementById("deleteInsteadCheck");
 const formatSelect = document.getElementById("formatSelect");
 let partsById = {}; // partId -> part info (name, partId) from the current Part Studio
+let allPartsList = []; // full unfiltered list from /api/parts, used by the search filter
+const partSearch = document.getElementById("partSearch");
 const uploadBtn = document.getElementById("uploadBtn");
 const statusEl = document.getElementById("status");
 const undoBtn = document.getElementById("undoBtn");
@@ -250,13 +253,79 @@ async function loadParts() {
     }
     partsById = {};
     data.parts.forEach((p) => { partsById[p.id] = p; });
+    allPartsList = data.parts;
     if (!data.parts.length) {
       partSelect.innerHTML = `<option disabled>No parts found - is this a Part Studio tab?</option>`;
       return;
     }
-    partSelect.innerHTML = data.parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join("");
+    renderPartOptions(allPartsList);
   } catch (err) {
     partSelect.innerHTML = `<option disabled>Error: ${err.message}</option>`;
+  }
+}
+
+function renderPartOptions(parts) {
+  const previouslySelected = new Set(Array.from(partSelect.selectedOptions).map((o) => o.value));
+  partSelect.innerHTML = parts.map((p) => `<option value="${p.id}"${previouslySelected.has(p.id) ? " selected" : ""}>${p.name}</option>`).join("")
+    || `<option disabled>No parts match "${partSearch.value}"</option>`;
+}
+
+partSearch?.addEventListener("input", () => {
+  const q = partSearch.value.trim().toLowerCase();
+  const filtered = q ? allPartsList.filter((p) => p.name.toLowerCase().includes(q)) : allPartsList;
+  renderPartOptions(filtered);
+});
+
+// ---------- sync viewport selection -> "Parts in current tab" list ----------
+// Onshape's Client Messaging API (element right-panel extension type) posts a
+// messageName:"SELECTION" message to this iframe whenever the user selects
+// something in the 3D view, after we've sent an "applicationInit" message.
+// Docs: https://onshape-public.github.io/docs/app-dev/messages/element-right-panel/
+// NOTE: the exact shape of the inbound SELECTION payload isn't fully spelled
+// out in Onshape's public docs, so this reads defensively across a few
+// plausible field names/shapes and falls back to matching by part name if an
+// id field doesn't line up with what /api/parts returned. Verify against a
+// live Onshape session and adjust the field-extraction below if selection
+// doesn't highlight correctly.
+function extractSelectedPartIds(data) {
+  const rawList = data.selections || data.selection || (Array.isArray(data.items) ? data.items : null) || [];
+  const ids = new Set();
+  for (const sel of rawList) {
+    const candidate = sel.partId || sel.selectionId || sel.id || sel.transientId;
+    if (candidate) ids.add(candidate);
+  }
+  return ids;
+}
+
+function syncPartSelectFromViewport(data) {
+  const selectedIds = extractSelectedPartIds(data);
+  if (!selectedIds.size || !allPartsList.length) return;
+  let matchedAny = false;
+  for (const opt of partSelect.options) {
+    if (selectedIds.has(opt.value)) {
+      opt.selected = true;
+      matchedAny = true;
+      opt.scrollIntoView({ block: "nearest" });
+    }
+  }
+  if (matchedAny) partSelect.dispatchEvent(new Event("change"));
+}
+
+if (ctx.server && ctx.documentId && ctx.elementId) {
+  window.addEventListener("message", (e) => {
+    if (e.origin !== ctx.server) return; // security: only trust messages from the iframe's own server origin
+    if (!e.data || e.data.messageName !== "SELECTION") return;
+    syncPartSelectFromViewport(e.data);
+  });
+  try {
+    window.parent.postMessage({
+      documentId: ctx.documentId,
+      workspaceId: ctx.workspaceOrVersionId,
+      elementId: ctx.elementId,
+      messageName: "applicationInit",
+    }, ctx.server);
+  } catch (err) {
+    console.warn("Could not send applicationInit to Onshape client:", err);
   }
 }
 

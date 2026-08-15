@@ -495,15 +495,25 @@ function renderTree() {
   treeRoot.appendChild(renderNode(nested, 0, ""));
   if (creatingFolderIn === "") treeRoot.appendChild(buildInlineCreateRow(""));
 
-  // allow dropping a dragged tree item onto empty space / the root to move it to top level
+  // allow dropping onto empty space / the root to move/land something at top level
   treeRoot.addEventListener("dragover", (e) => {
-    if (!draggingTreePath) return;
+    if (!draggingTreePath && !e.dataTransfer.types.includes("application/x-staged-id") && !e.dataTransfer.types.includes("text/plain")) return;
     e.preventDefault();
+    treeRoot.classList.add("dragover");
+    setTargetLineHighlight(null);
+    showDragBadge("→ repo root", e.clientX, e.clientY);
   });
+  treeRoot.addEventListener("dragleave", () => treeRoot.classList.remove("dragover"));
   treeRoot.addEventListener("drop", (e) => {
-    if (!draggingTreePath) return;
     e.preventDefault();
-    handleTreeMoveDrop("", e);
+    treeRoot.classList.remove("dragover");
+    hideDragBadge();
+    if (draggingTreePath) {
+      handleTreeMoveDrop("", e);
+      return;
+    }
+    const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
+    if (stagedId) assignDestination(stagedId, "");
   });
 
   document.getElementById("newFolderBtn").addEventListener("click", () => {
@@ -550,41 +560,26 @@ const collapsedPaths = new Set();
 let treeLoadedOnce = false;
 let draggingTreePath = null; // display path of the tree row currently being dragged (for move/reorganize)
 
-// ---------- Onshape-style horizontal nesting drag ----------
-// Instead of separate "drop on this exact spot" targets, hovering any row picks
-// a default target (the row's own folder - i.e. same level as what you're
-// hovering), and dragging sideways from where the drag STARTED walks up/down
-// the ancestor chain: drag right = one level deeper (only possible if you're
-// hovering an folder that's currently expanded), drag left = pull out to a
-// shallower folder, all the way out to the repo root.
-const INDENT_PX = 14; // must match .tree-node padding-left in panel.html
+// ---------- File-explorer-style drag targeting ----------
+// The row your cursor is over IS the target - exactly like VS Code's file
+// tree, Finder, or Onshape's own document browser. No horizontal-position
+// math, no "drag sideways to change nesting depth": hovering a folder row
+// means "drop into this folder"; hovering a file row means "this file's
+// folder" (and, for a staged card, "replace this file"). To land something
+// in an ancestor folder, drop it on that ancestor's own row (or collapse
+// down to it) - not by fiddling with pixel offsets mid-drag.
 let dragBadge = null;
 
-function ancestorFolders(path) {
-  // folder paths from root ("") up to (not including) path's own parent container
-  const parts = path.split("/").slice(0, -1);
-  const chain = [""];
-  let cur = "";
-  for (const p of parts) { cur = cur ? `${cur}/${p}` : p; chain.push(cur); }
-  return chain;
+function parentFolderOf(path) {
+  const idx = path.lastIndexOf("/");
+  return idx === -1 ? "" : path.substring(0, idx);
 }
 
-function computeDropTarget(entry, isFile, clientX, iconLeft) {
-  const chain = ancestorFolders(entry.__path);
-  const canNestInside = !isFile && !collapsedPaths.has(entry.__path); // only open folders are nest-able targets
-  const options = canNestInside ? [...chain, entry.__path] : chain;
-  const defaultIndex = chain.length - 1; // "same folder as the thing I'm hovering" - this IS this row's real screen depth
-  // iconLeft is this row's actual on-screen icon x, which sits at screen-depth
-  // defaultIndex (rows are really nested in the DOM, so depth <-> x is exact).
-  // Back that out to an absolute depth-0/root x origin so the target depth is
-  // driven purely by the cursor's absolute position - NOT by whichever row
-  // happens to be underneath it. Without this, the "steps=0" anchor jumps
-  // every time the pointer crosses onto a shallower/deeper row mid-drag, which
-  // is what made targeting feel random.
-  const originX = iconLeft == null ? null : iconLeft - defaultIndex * INDENT_PX;
-  const targetDepth = originX == null ? defaultIndex : Math.round((clientX - originX) / INDENT_PX);
-  const targetIndex = Math.max(0, Math.min(options.length - 1, targetDepth));
-  return { folder: options[targetIndex], isReplaceCandidate: isFile && targetIndex === defaultIndex, targetPath: options[targetIndex] };
+// Folder rows are themselves the target (drop INTO them); file rows target
+// their own parent folder (their row is what's visible on screen for that
+// folder, so that's what you drag onto to land a sibling there).
+function dropTargetFolderFor(entry, isFile) {
+  return isFile ? parentFolderOf(entry.__path) : entry.__path;
 }
 
 function showDragBadge(text, x, y) {
@@ -599,8 +594,8 @@ function hideDragBadge() {
   if (dragBadge) dragBadge.style.display = "none";
 }
 
-// Highlights the .tree-line of the ancestor folder currently targeted by a
-// drag, so the user gets live visual feedback on where a drop will land.
+// Highlights the .tree-line of the folder currently targeted by a drag, so
+// there's live visual feedback on where a drop will land.
 let highlightedTargetPath = null;
 function setTargetLineHighlight(path) {
   if (path === highlightedTargetPath) return;
@@ -623,12 +618,12 @@ document.addEventListener("dragend", () => { hideDragBadge(); clearTargetLineHig
 function bindDropTarget(el, entry, isFile) {
   el.addEventListener("dragover", (e) => {
     e.preventDefault();
-    const iconEl = el.querySelector(".tree-icon");
-    const iconLeft = (iconEl || el).getBoundingClientRect().left;
-    const { folder, isReplaceCandidate, targetPath } = computeDropTarget(entry, isFile, e.clientX, iconLeft);
-    el.classList.toggle("dragover", isReplaceCandidate);
-    setTargetLineHighlight(isReplaceCandidate ? null : targetPath);
-    showDragBadge(isReplaceCandidate ? `replace ${entry.__path.split("/").pop()}` : (folder === "" ? "→ repo root" : `→ ${folder}`), e.clientX, e.clientY);
+    const folder = dropTargetFolderFor(entry, isFile);
+    // dropping a staged card directly on a file's row always means "replace
+    // this file" - unambiguous, no position math needed
+    el.classList.add("dragover");
+    setTargetLineHighlight(isFile ? null : folder);
+    showDragBadge(isFile ? `replace ${entry.__path.split("/").pop()}` : (folder === "" ? "→ repo root" : `→ ${folder}`), e.clientX, e.clientY);
   });
   el.addEventListener("dragleave", () => el.classList.remove("dragover"));
   el.addEventListener("drop", (e) => {
@@ -637,15 +632,13 @@ function bindDropTarget(el, entry, isFile) {
     el.classList.remove("dragover");
     hideDragBadge();
     clearTargetLineHighlight();
-    const iconEl = el.querySelector(".tree-icon");
-    const iconLeft = (iconEl || el).getBoundingClientRect().left;
-    const { folder, isReplaceCandidate } = computeDropTarget(entry, isFile, e.clientX, iconLeft);
+    const folder = dropTargetFolderFor(entry, isFile);
     if (e.dataTransfer.types.includes("application/x-tree-move")) {
       handleTreeMoveDrop(folder, e); // moving an existing item never "replaces" - it always lands in the chosen folder
       return;
     }
     const stagedId = e.dataTransfer.getData("application/x-staged-id") || e.dataTransfer.getData("text/plain");
-    if (isReplaceCandidate) assignReplacement(stagedId, entry.__path, el);
+    if (isFile) assignReplacement(stagedId, entry.__path, el);
     else assignDestination(stagedId, folder);
   });
 }
@@ -744,7 +737,7 @@ function renderNode(node, depth, parentPath) {
       inner.addEventListener("dragend", () => { draggingTreePath = null; });
     }
 
-    // drop target behavior - same horizontal nesting logic for both files and folders
+    // drop target behavior - hovering a row IS the target (file-explorer style)
     bindDropTarget(inner, entry, isFile);
 
     row.appendChild(inner);
@@ -963,11 +956,12 @@ function assignDestination(stagedId, folderPath) {
   renderStage();
 }
 
-// unstaging by deselecting in the part list too
-partSelect.addEventListener("change", () => {
-  const selectedIds = new Set(Array.from(partSelect.selectedOptions).map((o) => o.value));
-  staged = staged.filter((s) => s.sourceParts.some((p) => selectedIds.has(p.partId)) || s.__manuallyKept);
-});
+// NOTE: deliberately no "unstage by deselecting in the part list" listener
+// here. A plain click on a different part in a native <select multiple>
+// clears the previous selection (without a modifier key held) - wiring that
+// to auto-unstage meant clicking a new part to stage silently unstaged
+// everything already staged. Unstaging is handled explicitly via the ✕ icon
+// on each staged card instead (see the unstage-icon handler above).
 
 // ---------- commit ----------
 

@@ -7,6 +7,9 @@ per-user OAuth on both sides, and a choice of export format.
 
 Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload) · licensed under [AGPLv3](./LICENSE)
 
+<img width="753" height="850" alt="image" src="https://github.com/user-attachments/assets/7af312f4-ddef-4eb2-8b25-80ebdd472ada" />
+
+
 ## What it does
 
 - **Signs each person in with their own GitHub and Onshape accounts** (OAuth
@@ -37,6 +40,9 @@ Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0u
   folder creates, archives, and new/replaced files — in one pass.
 
 ## How dragging works
+
+<img width="1910" height="993" alt="image" src="https://github.com/user-attachments/assets/355bb47e-ae71-429d-9775-b72ef0be61e4" />
+
 
 Modeled after VS Code's file tree / Finder / Onshape's own document
 browser: **the row your cursor is over is the target**, full stop.

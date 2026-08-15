@@ -14,4 +14,3 @@ Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0u
 - ✅ Staged batch commit, undo/redo (pre-commit only)
 - ✅ Inline rename with sibling-dim UX
 - ✅ File format picker (STEP / STL / OBJ / Parasolid / IGES / SolidWorks)
-- ⚠️ Not yet tested against live GitHub/Onshape APIs — see "known risk areas" belo

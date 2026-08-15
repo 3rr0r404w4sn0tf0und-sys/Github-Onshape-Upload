@@ -282,9 +282,19 @@ async function getFile(req, filePath) {
 
 async function putFile(req, filePath, contentBuffer, message, sha) {
   const { owner, name } = activeRepo(req);
+  // GitHub's create-or-update endpoint requires the CURRENT sha to overwrite
+  // a file that already exists - omit it and it 422s with "sha wasn't
+  // supplied" the moment the target path already has content. Look it up
+  // automatically unless the caller already has it in hand (cheaper when
+  // they do, e.g. the archive/replace flow that already fetched `existing`).
+  let resolvedSha = sha;
+  if (!resolvedSha) {
+    const existing = await getFile(req, filePath);
+    if (existing) resolvedSha = existing.sha;
+  }
   return octokitFor(req).repos.createOrUpdateFileContents({
     owner, repo: name, path: filePath, message,
-    content: contentBuffer.toString("base64"), sha: sha || undefined,
+    content: contentBuffer.toString("base64"), sha: resolvedSha || undefined,
   });
 }
 

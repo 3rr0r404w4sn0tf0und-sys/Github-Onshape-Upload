@@ -5,6 +5,8 @@
 
 const express = require("express");
 const session = require("express-session");
+const pgSession = require("connect-pg-simple")(session);
+const { Pool } = require("pg");
 const { Octokit } = require("@octokit/rest");
 const axios = require("axios");
 const path = require("path");
@@ -20,7 +22,20 @@ app.get("/", (req, res) => {
   res.redirect("/panel.html" + qs);
 });
 
+// Session store: Postgres (e.g. Neon) instead of the default in-memory store.
+// MemoryStore leaks memory over time and doesn't survive a restart/redeploy
+// or work across more than one server instance - fine for local dev, not for
+// production with real concurrent users. connect-pg-simple auto-creates its
+// "session" table on first run (createTableIfMissing).
+if (!process.env.DATABASE_URL) {
+  console.warn("DATABASE_URL is not set - falling back to in-memory sessions (NOT suitable for production).");
+}
+const pgPool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
 app.use(session({
+  store: pgPool ? new pgSession({ pool: pgPool, createTableIfMissing: true }) : undefined,
   secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -45,6 +60,58 @@ function requireAuth(req, res, next) {
 
 function octokitFor(req) {
   return new Octokit({ auth: req.session.accessToken });
+}
+
+// ---------- Onshape access token refresh ----------
+// Onshape access tokens expire (roughly an hour) - without this, any panel
+// session that runs longer than that hits a raw 401 "invalid_token" on
+// whatever Onshape call happens to fire next, which is confusing since
+// nothing about what the user did was wrong. This transparently uses the
+// stored refresh_token to mint a new access token and retries the call once.
+async function refreshOnshapeToken(req) {
+  if (!req.session.onshapeRefreshToken) {
+    delete req.session.onshapeAccessToken;
+    const err = new Error("Your Onshape session expired - please sign in to Onshape again.");
+    err.isKnownLimitation = true;
+    throw err;
+  }
+  try {
+    const tokenRes = await axios.post(
+      "https://oauth.onshape.com/oauth/token",
+      new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: req.session.onshapeRefreshToken,
+        client_id: OS_CLIENT_ID,
+        client_secret: OS_CLIENT_SECRET,
+      }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    req.session.onshapeAccessToken = tokenRes.data.access_token;
+    // Onshape may or may not rotate the refresh token on each use - keep the
+    // new one if it sent one back, otherwise the existing one stays valid.
+    if (tokenRes.data.refresh_token) req.session.onshapeRefreshToken = tokenRes.data.refresh_token;
+    return req.session.onshapeAccessToken;
+  } catch (err) {
+    console.error("Onshape token refresh failed:", err.response?.data || err.message);
+    delete req.session.onshapeAccessToken;
+    delete req.session.onshapeRefreshToken;
+    const wrapped = new Error("Your Onshape session expired - please sign in to Onshape again.");
+    wrapped.isKnownLimitation = true;
+    throw wrapped;
+  }
+}
+
+// Wraps a single Onshape API call: on a 401 (expired/invalid access token),
+// silently refreshes via refreshOnshapeToken and retries exactly once.
+// requestFn receives the current access token and returns the axios promise.
+async function onshapeRequest(req, requestFn) {
+  try {
+    return await requestFn(req.session.onshapeAccessToken);
+  } catch (err) {
+    if (err.response?.status !== 401) throw err;
+    await refreshOnshapeToken(req);
+    return await requestFn(req.session.onshapeAccessToken);
+  }
 }
 
 // ---------- GitHub OAuth flow ----------
@@ -244,9 +311,9 @@ app.get("/api/parts", requireAuth, async (req, res) => {
     // assembly with no Part Studio to export from at all. Scoping to a
     // single Part Studio sidesteps all of that.
     const url = `https://cad.onshape.com/api/v6/parts/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}`;
-    const { data } = await axios.get(url, {
-      headers: { Authorization: `Bearer ${req.session.onshapeAccessToken}` },
-    });
+    const { data } = await onshapeRequest(req, (token) =>
+      axios.get(url, { headers: { Authorization: `Bearer ${token}` } })
+    );
 
     const parts = (data || []).map((p) => ({
       id: p.partId,
@@ -257,6 +324,7 @@ app.get("/api/parts", requireAuth, async (req, res) => {
     res.json({ parts });
   } catch (err) {
     console.error(err.response?.data || err.message);
+    if (err.isKnownLimitation) return res.status(401).json({ error: err.message });
     res.status(500).json({ error: "Failed to fetch parts from this Part Studio" });
   }
 });
@@ -279,9 +347,8 @@ app.get("/api/parts", requireAuth, async (req, res) => {
 // that same live workspace/version context directly - no more per-part
 // document/microversion pinning, and no more "different Part Studio" merge
 // restriction, since everything staged always comes from the one open tab.
-async function exportPartsAsStep(onshapeToken, documentId, workspaceOrVersion, workspaceOrVersionId, elementId, partIds, merged, formatName) {
+async function exportPartsAsStep(req, documentId, workspaceOrVersion, workspaceOrVersionId, elementId, partIds, merged, formatName) {
   const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
-  const headers = { Authorization: `Bearer ${onshapeToken}` };
   const normalizedFormat = (formatName || "STEP").toUpperCase();
 
   try {
@@ -291,9 +358,11 @@ async function exportPartsAsStep(onshapeToken, documentId, workspaceOrVersion, w
     if (FORMATS_REQUIRING_RESOLUTION.has(normalizedFormat)) {
       body.resolution = "fine"; // required by Onshape for mesh formats, otherwise translation fails with "Invalid resolution parameters were specified"
     }
-    const { data: job } = await axios.post(translateUrl, body, { headers });
+    const { data: job } = await onshapeRequest(req, (token) =>
+      axios.post(translateUrl, body, { headers: { Authorization: `Bearer ${token}` } })
+    );
 
-    return await downloadOnshapeTranslation(headers, documentId, job.id);
+    return await downloadOnshapeTranslation(req, documentId, job.id);
   } catch (err) {
     if (err.response?.status === 404) {
       const notFoundErr = new Error(
@@ -307,12 +376,14 @@ async function exportPartsAsStep(onshapeToken, documentId, workspaceOrVersion, w
 }
 
 
-async function downloadOnshapeTranslation(headers, documentId, jobId) {
+async function downloadOnshapeTranslation(req, documentId, jobId) {
   const statusUrl = `https://cad.onshape.com/api/v6/translations/${jobId}`;
   let result;
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 2000));
-    const { data } = await axios.get(statusUrl, { headers });
+    const { data } = await onshapeRequest(req, (token) =>
+      axios.get(statusUrl, { headers: { Authorization: `Bearer ${token}` } })
+    );
     if (data.requestState === "DONE") { result = data; break; }
     if (data.requestState === "FAILED") throw new Error("Onshape translation failed: " + JSON.stringify(data));
   }
@@ -322,7 +393,9 @@ async function downloadOnshapeTranslation(headers, documentId, jobId) {
   // (/documents/d/{documentId}/externaldata/{fid}), NOT a bare /externaldata/{fid}.
   const fileId = result.resultExternalDataIds[0];
   const downloadUrl = `https://cad.onshape.com/api/v6/documents/d/${documentId}/externaldata/${fileId}`;
-  const { data: fileBuffer } = await axios.get(downloadUrl, { responseType: "arraybuffer", headers });
+  const { data: fileBuffer } = await onshapeRequest(req, (token) =>
+    axios.get(downloadUrl, { responseType: "arraybuffer", headers: { Authorization: `Bearer ${token}` } })
+  );
   return Buffer.from(fileBuffer);
 }
 
@@ -501,7 +574,7 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
 
       const buffer = await exportPartsAsStep(
-        req.session.onshapeAccessToken,
+        req,
         context.documentId,
         context.workspaceOrVersion,
         context.workspaceOrVersionId,

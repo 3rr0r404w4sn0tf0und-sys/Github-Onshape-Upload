@@ -51,6 +51,7 @@ Web Service, `npm install` / `node server.js`, Free tier. Environment variables:
 | `ONSHAPE_OAUTH_CLIENT_SECRET` | from step 2 |
 | `SESSION_SECRET` | Render's "Generate" button |
 | `APP_URL` | your Render URL, no trailing slash |
+| `DATABASE_URL` | Postgres connection string (e.g. from Neon) - sessions are stored here so they survive redeploys and work across multiple instances. If unset, falls back to in-memory sessions (fine for local dev only). |
 
 ## Using it
 1. Open an **Assembly** tab in Onshape, open the right sidebar, click the app icon.

@@ -1,6 +1,12 @@
 /**
  * Onshape -> GitHub side-panel app backend (multi-user OAuth version).
  * See README.md for setup instructions.
+ *
+ * Copyright (C) 2026  WanChengJunWang
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version. See the LICENSE file for the full text.
  */
 
 // Loads .env for local dev only - in production (Render, etc.) real env vars

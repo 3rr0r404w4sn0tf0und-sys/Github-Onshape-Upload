@@ -282,11 +282,16 @@ app.get("/api/parts", requireAuth, async (req, res) => {
 async function exportPartsAsStep(onshapeToken, documentId, workspaceOrVersion, workspaceOrVersionId, elementId, partIds, merged, formatName) {
   const translateUrl = `https://cad.onshape.com/api/v6/partstudios/d/${documentId}/${workspaceOrVersion}/${workspaceOrVersionId}/e/${elementId}/translations`;
   const headers = { Authorization: `Bearer ${onshapeToken}` };
+  const normalizedFormat = (formatName || "STEP").toUpperCase();
 
   try {
-    const { data: job } = await axios.post(translateUrl, {
-      formatName: formatName || "STEP", partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
-    }, { headers });
+    const body = {
+      formatName: normalizedFormat, partIds: partIds.join(","), onePartPerDoc: !merged, storeInDocument: false,
+    };
+    if (FORMATS_REQUIRING_RESOLUTION.has(normalizedFormat)) {
+      body.resolution = "fine"; // required by Onshape for mesh formats, otherwise translation fails with "Invalid resolution parameters were specified"
+    }
+    const { data: job } = await axios.post(translateUrl, body, { headers });
 
     return await downloadOnshapeTranslation(headers, documentId, job.id);
   } catch (err) {
@@ -416,6 +421,12 @@ const FORMAT_EXTENSIONS = {
   STEP: "step", STL: "stl", OBJ: "obj", PARASOLID: "x_t", IGES: "igs", SOLIDWORKS: "sldprt",
 };
 
+// Mesh-based formats reject the translation request with "Invalid resolution
+// parameters were specified" unless a `resolution` is included - STEP/IGES/
+// Parasolid/SolidWorks (exact-geometry formats) don't take this param at all.
+// See: https://forum.onshape.com/discussion/25465
+const FORMATS_REQUIRING_RESOLUTION = new Set(["STL", "OBJ", "GLTF", "GLB", "3MF", "URDF"]);
+
 app.post("/api/commit", requireAuth, async (req, res) => {
   if (!activeRepo(req)) return res.status(400).json({ error: "No repo selected" });
   const { deletes = [], items = [], renames = [], folderDeletes = [], folderCreates = [] } = req.body;
@@ -468,18 +479,26 @@ app.post("/api/commit", requireAuth, async (req, res) => {
       const ext = FORMAT_EXTENSIONS[formatName] || "step";
 
       const filename = `${item.name}.${ext}`;
+      // A static merge can be standing in for MULTIPLE previously-separate
+      // files (one staged part per old file) - replaceTargets carries all of
+      // them; replaceTarget (singular) is kept as a fallback for the
+      // non-static per-part path, which only ever has one.
+      const replaceTargets = (item.replaceTargets && item.replaceTargets.length)
+        ? item.replaceTargets
+        : (item.replaceTarget ? [item.replaceTarget] : []);
+      const primaryReplaceTarget = replaceTargets[0] || null;
+
       // When replacing, only the FOLDER should carry over from the old file -
       // the actual filename has to come from item.name/ext (what the user
       // picked this time), otherwise the rename and format choice both get
       // silently discarded and the old file just gets overwritten in place
       // under its old name/extension with the newly-exported content.
-      const replaceFolder = item.replaceTarget && item.replaceTarget.includes("/")
-        ? item.replaceTarget.substring(0, item.replaceTarget.lastIndexOf("/"))
+      const replaceFolder = primaryReplaceTarget && primaryReplaceTarget.includes("/")
+        ? primaryReplaceTarget.substring(0, primaryReplaceTarget.lastIndexOf("/"))
         : "";
-      const targetPath = item.replaceTarget
+      const targetPath = primaryReplaceTarget
         ? (replaceFolder ? `${replaceFolder}/${filename}` : filename)
         : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
-      const existing = item.replaceTarget ? await getFile(req, item.replaceTarget) : await getFile(req, targetPath);
 
       const buffer = await exportPartsAsStep(
         req.session.onshapeAccessToken,
@@ -492,25 +511,32 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         formatName,
       );
 
-      if (existing) {
-        // Archive/delete the OLD file at its own original path/name - never
-        // targetPath, which by this point is the NEW (possibly renamed) path.
-        const oldFilename = item.replaceTarget.includes("/") ? item.replaceTarget.substring(item.replaceTarget.lastIndexOf("/") + 1) : item.replaceTarget;
+      // Archive/delete every OLD file this export is replacing, each at its
+      // own original path/name - never targetPath, which by this point is
+      // the NEW (possibly renamed) path. A static merge with several staged
+      // parts, each with their own replaceTarget, needs ALL of them cleaned
+      // up here, not just the first.
+      let anyReplaced = false;
+      for (const oldPath of replaceTargets) {
+        const existing = await getFile(req, oldPath);
+        if (!existing) continue;
+        anyReplaced = true;
+        const oldFilename = oldPath.includes("/") ? oldPath.substring(oldPath.lastIndexOf("/") + 1) : oldPath;
         if (item.archiveMode === "delete") {
-          await deleteFile(req, item.replaceTarget, `chore: delete ${oldFilename} (replaced)`, existing.sha);
+          await deleteFile(req, oldPath, `chore: delete ${oldFilename} (replaced)`, existing.sha);
         } else {
-          const folder = replaceFolder;
+          const folder = oldPath.includes("/") ? oldPath.substring(0, oldPath.lastIndexOf("/")) : "";
           // Look for whatever "archive" folder already exists in this folder
           // (any casing) rather than always assuming one named exactly "Archive".
           const archiveFolderName = await findArchiveFolderName(req, folder);
           const archivePath = folder ? `${folder}/${archiveFolderName}/${oldFilename}` : `${archiveFolderName}/${oldFilename}`;
           await putFile(req, archivePath, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
-          await deleteFile(req, item.replaceTarget, `chore: remove old ${oldFilename} (archived)`, existing.sha);
+          await deleteFile(req, oldPath, `chore: remove old ${oldFilename} (archived)`, existing.sha);
         }
       }
 
       await putFile(req, targetPath, buffer, `feat: upload ${filename} from Onshape`);
-      results.push({ path: targetPath, action: existing ? (item.archiveMode === "delete" ? "replaced-deleted" : "replaced-archived") : "added" });
+      results.push({ path: targetPath, action: anyReplaced ? (item.archiveMode === "delete" ? "replaced-deleted" : "replaced-archived") : "added" });
     }
 
     res.json({ success: true, results });

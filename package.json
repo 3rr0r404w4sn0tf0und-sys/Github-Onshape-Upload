@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "description": "Onshape side-panel app that exports selected parts and uploads them to a GitHub repo with archive/delete/static logic.",
   "main": "server.js",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload"
+  },
   "scripts": {
     "start": "node server.js"
   },

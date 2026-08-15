@@ -349,13 +349,41 @@ stageBtn.addEventListener("click", () => {
     const info = partsById[opt.value];
     staged.push({
       id: crypto.randomUUID(),
-      partId: info.partId, // every staged part comes from THIS Part Studio (ctx) - no per-part source tracking needed anymore
-      partName: opt.textContent,
+      sourceParts: [{ partId: info.partId, partName: opt.textContent }], // Onshape parts folded into this card - becomes >1 once merged via "Static"
       name: opt.textContent,       // editable filename, defaults to part name
       replaceTarget: null,
+      replaceTargets: [],          // every old file this card's export will replace (can be >1 after a Static merge)
       destinationPath: null,
       archiveMode: deleteInsteadCheck.checked ? "delete" : "archive", // what happens to the file it replaces - defaults from the settings checkbox, overridable per-card via the 🗄/🗑 toggle
     });
+  }
+  snapshot();
+  renderStage();
+});
+
+// ---------- Static merge: collapses every staged card into ONE card ----------
+// Checking "Static" merges all currently-staged parts into a single staged
+// card (one name, one drag target, one exported file containing all their
+// geometry) - unchecking it undoes exactly that merge, splitting back into
+// the individual cards that existed right before it happened.
+let preStaticStaged = null;
+staticCheck.addEventListener("change", () => {
+  if (staticCheck.checked) {
+    if (staged.length < 2) return; // nothing to merge
+    preStaticStaged = JSON.parse(JSON.stringify(staged));
+    const merged = {
+      id: crypto.randomUUID(),
+      sourceParts: staged.flatMap((s) => s.sourceParts),
+      name: staged[0].name,
+      replaceTarget: staged.find((s) => s.replaceTarget)?.replaceTarget || null,
+      replaceTargets: staged.filter((s) => s.replaceTarget).map((s) => s.replaceTarget),
+      destinationPath: staged.find((s) => s.destinationPath)?.destinationPath || null,
+      archiveMode: staged.find((s) => s.replaceTarget)?.archiveMode || (deleteInsteadCheck.checked ? "delete" : "archive"),
+    };
+    staged = [merged];
+  } else if (preStaticStaged) {
+    staged = preStaticStaged;
+    preStaticStaged = null;
   }
   snapshot();
   renderStage();
@@ -830,8 +858,9 @@ function renderStage() {
       const dest = item.replaceTarget
         ? ` → replaces ${item.replaceTarget.split("/").pop()}`
         : (item.destinationPath ? ` → ${item.destinationPath}/` : "");
+      const mergedTag = item.sourceParts.length > 1 ? ` <span style="opacity:0.55; font-size:10px;">(merged, ${item.sourceParts.length} parts)</span>` : "";
       card.innerHTML = `
-        <span class="row-label">${FILE_SVG} ${item.name}${dest}</span>
+        <span class="row-label">${FILE_SVG} ${item.name}${mergedTag}${dest}</span>
         <span class="row-actions">
           ${item.replaceTarget ? `<span class="mode-icon" title="${item.archiveMode === "delete" ? "Old file will be deleted - click to archive instead" : "Old file will be archived - click to delete instead"}">${item.archiveMode === "delete" ? "🗑" : "🗄"}</span>` : ""}
           <span class="rename-icon" title="Rename">✎</span>
@@ -905,6 +934,7 @@ function assignReplacement(stagedId, targetPath, rowEl) {
   const item = staged.find((s) => s.id === stagedId);
   if (!item) return;
   item.replaceTarget = targetPath;
+  item.replaceTargets = [targetPath]; // an explicit drag supersedes whatever targets were carried over from a merge
   item.destinationPath = null;
   // little "flies off" cue on the tree row to signal it'll be archived/deleted on commit
   rowEl.classList.add("flying-away");
@@ -917,6 +947,7 @@ function assignDestination(stagedId, folderPath) {
   const item = staged.find((s) => s.id === stagedId);
   if (!item) return;
   item.replaceTarget = null;
+  item.replaceTargets = [];
   item.destinationPath = folderPath;
   snapshot();
   renderStage();
@@ -925,7 +956,7 @@ function assignDestination(stagedId, folderPath) {
 // unstaging by deselecting in the part list too
 partSelect.addEventListener("change", () => {
   const selectedIds = new Set(Array.from(partSelect.selectedOptions).map((o) => o.value));
-  staged = staged.filter((s) => selectedIds.has(s.partId) || s.__manuallyKept);
+  staged = staged.filter((s) => s.sourceParts.some((p) => selectedIds.has(p.partId)) || s.__manuallyKept);
 });
 
 // ---------- commit ----------
@@ -951,27 +982,19 @@ uploadBtn.addEventListener("click", async () => {
 
   const formatName = formatSelect.value;
 
-  const partRef = (s) => ({ partId: s.partId }); // every part comes from `ctx` (the open Part Studio), sent once below - not per-part anymore
-
-  const items = staticCheck.checked
-    ? [{
-        parts: staged.map(partRef),
-        isStatic: true,
-        name: staged[0]?.name || "Static Export",
-        replaceTarget: staged.find((s) => s.replaceTarget)?.replaceTarget || null,
-        destinationPath: staged.find((s) => s.destinationPath)?.destinationPath || null,
-        archiveMode: staged[0]?.archiveMode || "archive",
-        formatName,
-      }]
-    : staged.map((s) => ({
-        parts: [partRef(s)],
-        isStatic: false,
-        name: s.name,
-        replaceTarget: s.replaceTarget,
-        destinationPath: s.destinationPath,
-        archiveMode: s.archiveMode,
-        formatName,
-      }));
+  // The Static checkbox already merged staged cards client-side (see the
+  // change listener above), so each card here just carries whatever parts
+  // it ended up with - no separate static/non-static branching needed.
+  const items = staged.map((s) => ({
+    parts: s.sourceParts.map((p) => ({ partId: p.partId })),
+    isStatic: s.sourceParts.length > 1,
+    name: s.name,
+    replaceTarget: s.replaceTarget,
+    replaceTargets: (s.replaceTargets && s.replaceTargets.length) ? s.replaceTargets : (s.replaceTarget ? [s.replaceTarget] : []),
+    destinationPath: s.destinationPath,
+    archiveMode: s.archiveMode,
+    formatName,
+  }));
 
   try {
     const res = await fetch("/api/commit", {

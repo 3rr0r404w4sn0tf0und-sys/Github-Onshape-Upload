@@ -271,8 +271,20 @@ function activeRepo(req) {
 
 async function getFile(req, filePath) {
   const { owner, name } = activeRepo(req);
+  const octokit = octokitFor(req);
   try {
-    const res = await octokitFor(req).repos.getContent({ owner, repo: name, path: filePath });
+    const res = await octokit.repos.getContent({ owner, repo: name, path: filePath });
+    if (Array.isArray(res.data)) return null; // path is a directory, not a file
+    if (!res.data.content && res.data.sha) {
+      // GitHub's Contents API doesn't reliably return inline content for
+      // files over ~1MB (content comes back empty, no error) - common for
+      // CAD exports (STEP/Parasolid) once they have any real complexity.
+      // Fall back to the git blobs API, which supports up to 100MB, so
+      // archiving/replacing a large file doesn't silently write an empty
+      // file where the old content should be.
+      const blob = await octokit.git.getBlob({ owner, repo: name, file_sha: res.data.sha });
+      return { ...res.data, content: blob.data.content, encoding: blob.data.encoding };
+    }
     return res.data;
   } catch (err) {
     if (err.status === 404) return null;

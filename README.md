@@ -40,7 +40,23 @@ On the same OAuth application page → **Extensions** tab → Add extension.
 This keeps it private to your account — no App Store submission or
 Development Agreement needed.
 
-### 4. Deploy on Render
+### 4. Set up Postgres for session storage (Neon)
+Sessions (and the GitHub/Onshape tokens they carry) are stored in Postgres,
+not in-memory - this is what lets the app survive a redeploy and run more
+than one server instance.
+- In your Neon dashboard, create a project (or reuse an existing one - this
+  app only needs its own database within it, e.g. `onshape_github_sessions`).
+- Go to **Connect** on the project and copy the **pooled** connection string
+  (the host contains `-pooler`, not the direct one) - this app opens a
+  connection per session lookup, which is exactly what the pooled endpoint
+  is designed for.
+- No manual schema/migration needed - `connect-pg-simple` creates its own
+  `session` table automatically on first boot.
+- Locally, copy `.env.example` to `.env` and drop the connection string in
+  as `DATABASE_URL`. In production, set it as a real environment variable
+  (see step 5).
+
+### 5. Deploy on Render
 Web Service, `npm install` / `node server.js`, Free tier. Environment variables:
 
 | Variable | Value |
@@ -51,7 +67,7 @@ Web Service, `npm install` / `node server.js`, Free tier. Environment variables:
 | `ONSHAPE_OAUTH_CLIENT_SECRET` | from step 2 |
 | `SESSION_SECRET` | Render's "Generate" button |
 | `APP_URL` | your Render URL, no trailing slash |
-| `DATABASE_URL` | Postgres connection string (e.g. from Neon) - sessions are stored here so they survive redeploys and work across multiple instances. If unset, falls back to in-memory sessions (fine for local dev only). |
+| `DATABASE_URL` | pooled Neon connection string from step 4 |
 
 ## Using it
 1. Open an **Assembly** tab in Onshape, open the right sidebar, click the app icon.

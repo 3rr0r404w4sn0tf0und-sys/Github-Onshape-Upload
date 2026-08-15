@@ -3,6 +3,10 @@
  * See README.md for setup instructions.
  */
 
+// Loads .env for local dev only - in production (Render, etc.) real env vars
+// are already set, and dotenv silently no-ops if there's no .env file.
+require("dotenv").config();
+
 const express = require("express");
 const session = require("express-session");
 const pgSession = require("connect-pg-simple")(session);
@@ -27,12 +31,30 @@ app.get("/", (req, res) => {
 // or work across more than one server instance - fine for local dev, not for
 // production with real concurrent users. connect-pg-simple auto-creates its
 // "session" table on first run (createTableIfMissing).
+//
+// max: 10 keeps this well under Neon's free-tier pooled-connection ceiling
+// even if Render spins up a couple of instances; idleTimeoutMillis lets idle
+// connections close instead of sitting open against a serverless endpoint
+// that autosuspends on inactivity anyway.
 if (!process.env.DATABASE_URL) {
   console.warn("DATABASE_URL is not set - falling back to in-memory sessions (NOT suitable for production).");
 }
 const pgPool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }, // Neon requires SSL; its cert chain isn't in Node's default trust store
+      max: 10,
+      idleTimeoutMillis: 30000,
+    })
   : null;
+
+if (pgPool) {
+  pgPool.on("error", (err) => {
+    // Fires for connections sitting idle in the pool that get dropped server-side
+    // (e.g. Neon autosuspend/reconnect) - log it, don't crash the whole process.
+    console.error("Unexpected Postgres pool error:", err.message);
+  });
+}
 
 app.use(session({
   store: pgPool ? new pgSession({ pool: pgPool, createTableIfMissing: true }) : undefined,

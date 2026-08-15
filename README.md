@@ -1,110 +1,140 @@
 # Onshape → GitHub Side Panel App
 
-Exports selected parts from an Onshape **Assembly** and uploads them to a
-chosen spot in a GitHub repo you pick — with drag-to-replace, archive/delete,
-static merging, per-user OAuth on both sides, and your choice of export format.
+A side panel that lives inside an Onshape **Part Studio** tab and exports
+selected parts straight into a GitHub repo — with drag-to-replace,
+archive-or-delete for replaced files, merging multiple parts into one file,
+per-user OAuth on both sides, and a choice of export format.
 
 Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload) · licensed under [AGPLv3](./LICENSE)
 
-## Current setup status (as of this build)
-- ✅ GitHub OAuth (multi-user, repo picker, default repo, switch repo)
-- ✅ Onshape OAuth (multi-user)
-- ✅ Assembly-context part listing
-- ✅ Drag-and-drop tree with replace/add, per-file trash, per-file/folder rename, new-folder button
-- ✅ Staged batch commit, undo/redo (pre-commit only)
-- ✅ Inline rename with sibling-dim UX
-- ✅ File format picker (STEP / STL / OBJ / Parasolid / IGES / SolidWorks)
-- ⚠️ Not yet tested against live GitHub/Onshape APIs — see "known risk areas" below
+## What it does
 
-## Setup
+- **Signs each person in with their own GitHub and Onshape accounts** (OAuth
+  on both sides) — commits are attributed to the actual person, not a shared
+  bot, and every user's GitHub API usage is walled off under their own token.
+- **Lists every part in the currently open Part Studio tab**, with a search
+  box to filter by name, and can auto-select the matching part(s) when you
+  select something in the 3D viewport.
+- **Stages parts for upload**, where each staged card can be:
+  - dragged onto an existing file in the repo tree to **replace** it,
+  - dragged onto a folder (or the empty tree background, for repo root) to
+    set where it lands,
+  - renamed inline before upload,
+  - merged with other staged cards into **one exported file** ("Static"),
+    which can then be renamed/dragged as a single unit — unchecking Static
+    splits it back into the individual cards it came from.
+- **Archive or delete** whatever file a staged part replaces — archiving
+  moves the old file into whatever `Archive`-named folder already exists
+  next to it (any casing), falling back to creating `Archive/` if none
+  exists; delete removes it outright. Toggleable per staged card, with a
+  global default in settings.
+- **Full repo tree management**: inline rename, new folder, delete
+  file/folder, drag files and folders around to reorganize — all staged
+  client-side and only touching GitHub once you actually commit.
+- **File format choice**: STEP, STL, OBJ, Parasolid, IGES, SolidWorks.
+- **Undo/redo** (Ctrl+Z / Ctrl+Y) for everything staged before you commit.
+- One **Upload to GitHub** click commits the whole batch — renames, deletes,
+  folder creates, archives, and new/replaced files — in one pass.
 
-### 1. Register a GitHub OAuth App
-GitHub → Settings → Developer settings → **OAuth Apps** → New OAuth App.
-- Homepage URL: your Render URL
-- Callback URL: `https://YOUR-RENDER-URL/auth/github/callback`
-Save the Client ID + Client Secret.
+## How dragging works
 
-### 2. Register an Onshape OAuth App
-Onshape → account icon → My account → Developer tab → OAuth applications → New.
-- Type: **Cloud connected app**
-- Redirect URL: `https://YOUR-RENDER-URL/auth/onshape/callback`
-- OAuth URL: `https://YOUR-RENDER-URL/`
-- Permissions: only check **read profile** + **read documents** (this app never
-  writes to or deletes Onshape documents, so leave write/delete unchecked)
-Save the Client ID + Client Secret.
-
-### 3. Add the panel as an Extension (not an App Store listing)
-On the same OAuth application page → **Extensions** tab → Add extension.
-- Location: Element right panel
-- Context: **Inside assembly**
-- Action URL: `https://YOUR-RENDER-URL/panel.html`
-
-This keeps it private to your account — no App Store submission or
-Development Agreement needed.
-
-### 4. Set up Postgres for session storage (Neon)
-Sessions (and the GitHub/Onshape tokens they carry) are stored in Postgres,
-not in-memory - this is what lets the app survive a redeploy and run more
-than one server instance.
-- In your Neon dashboard, create a project (or reuse an existing one - this
-  app only needs its own database within it, e.g. `onshape_github_sessions`).
-- Go to **Connect** on the project and copy the **pooled** connection string
-  (the host contains `-pooler`, not the direct one) - this app opens a
-  connection per session lookup, which is exactly what the pooled endpoint
-  is designed for.
-- No manual schema/migration needed - `connect-pg-simple` creates its own
-  `session` table automatically on first boot.
-- Locally, copy `.env.example` to `.env` and drop the connection string in
-  as `DATABASE_URL`. In production, set it as a real environment variable
-  (see step 5).
-
-### 5. Deploy on Render
-Web Service, `npm install` / `node server.js`, Free tier. Environment variables:
-
-| Variable | Value |
-|---|---|
-| `GITHUB_OAUTH_CLIENT_ID` | from step 1 |
-| `GITHUB_OAUTH_CLIENT_SECRET` | from step 1 |
-| `ONSHAPE_OAUTH_CLIENT_ID` | from step 2 |
-| `ONSHAPE_OAUTH_CLIENT_SECRET` | from step 2 |
-| `SESSION_SECRET` | Render's "Generate" button |
-| `APP_URL` | your Render URL, no trailing slash |
-| `DATABASE_URL` | pooled Neon connection string from step 4 |
+Modeled after VS Code's file tree / Finder / Onshape's own document
+browser: **the row your cursor is over is the target**, full stop.
+- Hovering a **folder row** → drop *into* that folder.
+- Hovering a **file row** → targets that file's own folder, and for a
+  staged card, means "replace this file."
+- To land something in an ancestor folder, drop it directly on that
+  ancestor's own visible row (or the empty tree background for repo root) —
+  there's no pixel-offset math to fight with.
 
 ## Using it
-1. Open an **Assembly** tab in Onshape, open the right sidebar, click the app icon.
+
+1. Open a **Part Studio** tab in Onshape, open the right sidebar, click the
+   app icon.
 2. Sign in with GitHub, then with Onshape (both required).
-3. Pick a repo — **Use** (this session only) or **Set default** (⭐, remembered).
-4. Select parts from the list (pulled from the whole assembly, including
-   parts from different Part Studio tabs) → **Stage selected parts**.
+3. Pick a repo — **Use** (this session only) or **Set default** (⭐,
+   remembered for next time).
+4. Select parts from the list — search to filter, or select them directly
+   in the 3D viewport — then **Stage selected parts**.
 5. In the tree: drag a staged card onto an existing file to replace it
-   (auto-archived to `Archive/`, or hard-deleted if you toggle that file's
-   trash icon into delete-mode), or onto a folder to just add it there.
-6. Rename staged files inline (✎) — other staged cards dim while you edit.
-7. Set **Static** if some staged parts should merge into one file — note
-   they must all come from the *same* Part Studio tab; Onshape can't merge
-   geometry across tabs in one export call, and you'll get a clear error if
-   you try.
+   (archived to an `Archive` folder, or hard-deleted if that card's
+   trash-icon is toggled into delete-mode), or onto a folder to just add it
+   there.
+6. Rename staged files inline (✎).
+7. Check **Static** if some staged parts should merge into one exported
+   file — this collapses them into a single staged card you can rename and
+   drag like any other; unchecking it restores the individual cards.
 8. Pick your **file format**.
-9. Ctrl+Z / Ctrl+Y undo/redo your staging (not anything already committed).
+9. Ctrl+Z / Ctrl+Y to undo/redo staging changes (nothing already committed).
 10. **Upload to GitHub** commits the whole batch in one pass.
 
-## Known risk areas — the parts most likely to need a live fix
-These have been written against Onshape/GitHub's documented API shapes and
-syntax-checked, but not run against the real APIs yet:
-- **Onshape OAuth token endpoint** — `server.js` uses `cad.onshape.com/oauth/token`;
-  Onshape's own docs have been inconsistent historically about this vs
-  `oauth.onshape.com`. First place to check on a 401.
-- **Assembly instance field names** (`sourceElementId` etc. in `/api/parts`) —
-  best-effort mapping of Onshape's assembly-instances response; likely needs
-  a small adjustment once you see the real JSON.
-- **File format strings for Parasolid/IGES/SolidWorks** — STEP/STL/OBJ are
-  safe bets, the other three may need exact string tweaks.
-- **Cookies inside Onshape's iframe** (`SameSite=None; Secure`) — works in
-  most browsers, Safari/iOS can be stricter. Symptom: keeps asking you to
-  sign in again.
+## Fixed issues (changelog)
 
-## Other notes
-- Sessions live in server memory — a Render restart logs everyone out.
-- Static-merge-across-Part-Studios is a real Onshape API limitation, not a
-  bug in this app — see step 7 above.
+Roughly newest first — kept here so anyone picking this repo back up has
+context on what's already been chased down.
+
+- **`sha` not supplied on file writes** — `putFile` now looks up the
+  target path's current `sha` automatically before writing, instead of
+  every write assuming the path was brand new. Fixes commits failing
+  outright the moment you tried to overwrite anything that already existed
+  (re-uploads, re-archiving, recreating a `.gitkeep`, renames landing on an
+  existing name).
+- **Archived files silently truncated to empty for large parts** —
+  GitHub's Contents API doesn't reliably return file content over ~1MB
+  (common for STEP/Parasolid exports of any real complexity); it just
+  comes back empty with no error. `getFile` now falls back to the git
+  blobs API (100MB limit) whenever that happens.
+- **Onshape session expiring mid-work** — access tokens expire roughly
+  hourly; the app already stored a refresh token but never used it. Any
+  Onshape API call that gets a 401 now silently refreshes and retries once,
+  instead of surfacing a raw `invalid_token` error.
+- **Static merge not actually merging in the UI** — checking "Static"
+  previously only affected the export at commit time; the staged list
+  still showed separate cards. It now visibly collapses staged cards into
+  one on check, and restores them on uncheck.
+- **Static merge only archiving/deleting the first replaced file** — a
+  merged export standing in for several old files was only cleaning up one
+  of them; it now archives/deletes every file it's replacing.
+- **OBJ/STL export failing with "Invalid resolution parameters were
+  specified"** — mesh formats require a `resolution` param on the Onshape
+  translation request that wasn't being sent; STEP/IGES/Parasolid/
+  SolidWorks were unaffected.
+- **Unstaging everything by selecting a different part** — a plain click
+  on a new part in the native multi-select list was clearing the previous
+  selection (no modifier key held), which was wired to auto-unstage.
+  Unstaging is now only ever explicit, via the ✕ on a staged card.
+- **Drag targeting feeling inaccurate/random** — the old system inferred
+  nesting depth from horizontal drag distance from a per-row anchor that
+  reset every time the pointer crossed onto a different row, so the same
+  physical mouse position could resolve to different targets moment to
+  moment. Replaced entirely with the file-explorer model described above.
+- **Replacing a file discarding the new name/format** — `targetPath` used
+  to be built from the *old* file's name; now only the destination
+  *folder* carries over from the replaced file, and the filename/extension
+  always comes from what you actually picked this time.
+- **Assembly-based export silently exporting the whole assembly** —
+  Onshape's assembly translation endpoint ignores any part filter and
+  always exports everything, making a true per-part "assembly tool"
+  impossible via that endpoint. The app is Part Studio-scoped by design as
+  a result — see "How it's scoped" below.
+- **Sessions not surviving a redeploy/restart** — originally in-memory,
+  which also doesn't work across more than one server instance. Now
+  Postgres-backed via Neon.
+
+## How it's scoped
+
+This app only ever reads from and exports the single Part Studio tab it was
+opened from — never a whole Assembly. That's a deliberate tradeoff, not a
+missing feature: Onshape's assembly translation endpoint ignores per-part
+filtering and always exports the entire assembly regardless of which parts
+you select, and in-context/composite parts authored directly inside an
+assembly (with no real Part Studio backing them) aren't exportable via the
+API at all. Scoping to a single Part Studio sidesteps both problems
+entirely, at the cost of not being usable directly from an assembly view.
+
+## License
+
+AGPLv3 — see [`LICENSE`](./LICENSE). Because this runs as a network
+service, anyone interacting with a deployed instance is entitled to the
+source corresponding to what's actually running (AGPL §13); the footer
+link in the panel itself points back to this repo for that reason.

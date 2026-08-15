@@ -7,9 +7,6 @@ per-user OAuth on both sides, and a choice of export format.
 
 Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload) · licensed under [AGPLv3](./LICENSE)
 
-<img width="753" height="850" alt="image" src="https://github.com/user-attachments/assets/7af312f4-ddef-4eb2-8b25-80ebdd472ada" />
-
-
 ## What it does
 
 - **Signs each person in with their own GitHub and Onshape accounts** (OAuth
@@ -40,9 +37,6 @@ Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0u
   folder creates, archives, and new/replaced files — in one pass.
 
 ## How dragging works
-
-<img width="1910" height="993" alt="image" src="https://github.com/user-attachments/assets/355bb47e-ae71-429d-9775-b72ef0be61e4" />
-
 
 Modeled after VS Code's file tree / Finder / Onshape's own document
 browser: **the row your cursor is over is the target**, full stop.
@@ -137,6 +131,32 @@ you select, and in-context/composite parts authored directly inside an
 assembly (with no real Part Studio backing them) aren't exportable via the
 API at all. Scoping to a single Part Studio sidesteps both problems
 entirely, at the cost of not being usable directly from an assembly view.
+
+## Privacy
+
+This app connects to real GitHub and Onshape accounts, so here's exactly
+what it can see and what it stores.
+
+**GitHub** — your username and avatar, plus full read/write access to your
+repositories (that's what the `repo` OAuth scope grants). The app only
+ever touches the one repo you actively select in the panel, but the token
+itself isn't scoped narrower than that by GitHub.
+
+**Onshape** — your profile and read-only access to your documents, used to
+list parts in the currently open Part Studio and export them. The app
+never writes to, deletes, or modifies anything in Onshape.
+
+**Stored server-side** (Postgres, tied to your session cookie, kept for
+~1 year unless you sign out or clear cookies):
+- GitHub username, avatar URL, and access token
+- Onshape access + refresh tokens
+- Your default/active repo selection
+
+No email address is collected. Nothing is sold or shared with third
+parties. Tokens are only ever used to carry out actions initiated in the
+panel (staging/uploading) — see [`server.js`](./server.js) for exactly
+where each token is used. The same notice is shown in-app on first use,
+and re-openable anytime via the "Privacy" link in the panel's footer.
 
 ## License
 

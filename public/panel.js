@@ -17,6 +17,24 @@ const ctx = {
   server: params.get("server"), // origin Onshape posts messages from - required to send/receive Client Messaging postMessages
 };
 
+// ---------- privacy notice ----------
+// Shown once (until dismissed) on first load, and re-openable anytime via
+// the footer link. Purely a local "have they seen it" flag - not sent
+// anywhere, just gates whether the overlay auto-shows on load.
+const PRIVACY_ACK_KEY = "onshape-github-privacy-ack";
+const privacyOverlay = document.getElementById("privacyOverlay");
+document.getElementById("privacyAcceptBtn")?.addEventListener("click", () => {
+  localStorage.setItem(PRIVACY_ACK_KEY, "1");
+  privacyOverlay.classList.remove("visible");
+});
+document.getElementById("privacyReopenLink")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  privacyOverlay.classList.add("visible");
+});
+if (!localStorage.getItem(PRIVACY_ACK_KEY)) {
+  privacyOverlay.classList.add("visible");
+}
+
 const loginView = document.getElementById("loginView");
 const repoPickerView = document.getElementById("repoPickerView");
 const mainView = document.getElementById("mainView");

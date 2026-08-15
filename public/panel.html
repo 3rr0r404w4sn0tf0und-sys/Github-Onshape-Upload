@@ -99,9 +99,39 @@
 
   #partSelectWrap { margin-bottom:8px; }
   select { width:100%; padding:5px; background:#2b2d31; color:#eee; border:1px solid #444; border-radius:4px; font-size:11px; }
+
+  #privacyOverlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; padding:16px; }
+  #privacyOverlay.visible { display:flex; }
+  #privacyModal { background:#25262a; border:1px solid #3a3b3e; border-radius:8px; padding:16px; max-width:420px; max-height:80vh; overflow-y:auto; font-size:11px; line-height:1.5; }
+  #privacyModal h3 { margin:0 0 8px; font-size:13px; }
+  #privacyModal ul { margin:6px 0; padding-left:18px; }
+  #privacyModal button { width:100%; margin-top:12px; padding:8px; background:#2ea043; color:#fff; border:none; border-radius:5px; font-weight:600; cursor:pointer; font-size:12px; }
 </style>
 </head>
 <body>
+<div id="privacyOverlay">
+  <div id="privacyModal">
+    <h3>What this app can see and store</h3>
+    <p><strong>GitHub</strong> — your username and avatar, plus full read/write
+      access to your repositories (that's what the <code>repo</code> OAuth
+      scope grants). This app only ever touches the one repo you actively
+      pick, but the token itself isn't scoped narrower than that by GitHub.</p>
+    <p><strong>Onshape</strong> — your profile and read-only access to your
+      documents, used to list parts in the open Part Studio and export them.
+      This app never writes to, deletes, or modifies anything in Onshape.</p>
+    <p><strong>Stored server-side</strong> (Postgres, tied to your session
+      cookie, ~1 year unless you sign out or clear cookies):</p>
+    <ul>
+      <li>GitHub username, avatar URL, and access token</li>
+      <li>Onshape access + refresh tokens</li>
+      <li>Your default/active repo selection</li>
+    </ul>
+    <p>No email address is collected. Nothing is sold or shared with third
+      parties. Tokens are only ever used to carry out actions you actively
+      initiate in the panel (staging/uploading).</p>
+    <button id="privacyAcceptBtn">Got it</button>
+  </div>
+</div>
 <div id="dragHint"></div>
 
 <div id="loginView">
@@ -158,7 +188,7 @@
   <div id="status"></div>
 
   <div id="appFooter" style="margin-top:10px; padding-top:8px; border-top:1px solid #3a3b3e; font-size:10px; opacity:0.5; text-align:center;">
-    Created by WanChengJunWang · <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload" target="_blank" rel="noopener" style="color:inherit;">Source (AGPLv3)</a>
+    Created by WanChengJunWang · <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload" target="_blank" rel="noopener" style="color:inherit;">Source (AGPLv3)</a> · <a href="#" id="privacyReopenLink" style="color:inherit;">Privacy</a>
   </div>
 </div>
 

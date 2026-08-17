@@ -17,22 +17,42 @@ const ctx = {
   server: params.get("server"), // origin Onshape posts messages from - required to send/receive Client Messaging postMessages
 };
 
-// ---------- privacy notice ----------
-// Shown once (until dismissed) on first load, and re-openable anytime via
-// the footer link. Purely a local "have they seen it" flag - not sent
-// anywhere, just gates whether the overlay auto-shows on load.
+// ---------- privacy notice + terms of service ----------
+// Both shown once (until dismissed) on first load - privacy first, then
+// terms right after - and each is re-openable anytime via its own footer
+// link. Purely local "have they seen it" flags - not sent anywhere, just
+// gate whether each overlay auto-shows on load.
 const PRIVACY_ACK_KEY = "onshape-github-privacy-ack";
+const TOS_ACK_KEY = "onshape-github-tos-ack";
 const privacyOverlay = document.getElementById("privacyOverlay");
+const tosOverlay = document.getElementById("tosOverlay");
+
 document.getElementById("privacyAcceptBtn")?.addEventListener("click", () => {
   localStorage.setItem(PRIVACY_ACK_KEY, "1");
   privacyOverlay.classList.remove("visible");
+  // Chain straight into terms if they haven't seen those yet either.
+  if (!localStorage.getItem(TOS_ACK_KEY)) {
+    tosOverlay.classList.add("visible");
+  }
 });
 document.getElementById("privacyReopenLink")?.addEventListener("click", (e) => {
   e.preventDefault();
   privacyOverlay.classList.add("visible");
 });
+
+document.getElementById("tosAcceptBtn")?.addEventListener("click", () => {
+  localStorage.setItem(TOS_ACK_KEY, "1");
+  tosOverlay.classList.remove("visible");
+});
+document.getElementById("tosReopenLink")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  tosOverlay.classList.add("visible");
+});
+
 if (!localStorage.getItem(PRIVACY_ACK_KEY)) {
   privacyOverlay.classList.add("visible");
+} else if (!localStorage.getItem(TOS_ACK_KEY)) {
+  tosOverlay.classList.add("visible");
 }
 
 const loginView = document.getElementById("loginView");

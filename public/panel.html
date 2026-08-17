@@ -106,6 +106,13 @@
   #privacyModal h3 { margin:0 0 8px; font-size:13px; }
   #privacyModal ul { margin:6px 0; padding-left:18px; }
   #privacyModal button { width:100%; margin-top:12px; padding:8px; background:#2ea043; color:#fff; border:none; border-radius:5px; font-weight:600; cursor:pointer; font-size:12px; }
+
+  #tosOverlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:10000; align-items:center; justify-content:center; padding:16px; }
+  #tosOverlay.visible { display:flex; }
+  #tosModal { background:#25262a; border:1px solid #3a3b3e; border-radius:8px; padding:16px; max-width:420px; max-height:80vh; overflow-y:auto; font-size:11px; line-height:1.5; }
+  #tosModal h3 { margin:0 0 8px; font-size:13px; }
+  #tosModal ul { margin:6px 0; padding-left:18px; }
+  #tosModal button { width:100%; margin-top:12px; padding:8px; background:#2ea043; color:#fff; border:none; border-radius:5px; font-weight:600; cursor:pointer; font-size:12px; }
 </style>
 </head>
 <body>
@@ -130,6 +137,26 @@
       parties. Tokens are only ever used to carry out actions you actively
       initiate in the panel (staging/uploading).</p>
     <button id="privacyAcceptBtn">Got it</button>
+  </div>
+</div>
+
+<div id="tosOverlay">
+  <div id="tosModal">
+    <h3>Terms of Service</h3>
+    <p>This app is free and <strong>AGPLv3</strong>-licensed, and is
+      provided <strong>as-is, with no warranty of any kind</strong>. You
+      use it at your own risk.</p>
+    <p>This app can <strong>create, rename, overwrite, archive, and
+      delete files</strong> in whatever GitHub repo you select, based on
+      what you stage. You're responsible for reviewing staged changes
+      before clicking <strong>Upload to GitHub</strong> — the author isn't
+      liable for lost, overwritten, or corrupted files, bad commits, or
+      any other repo damage resulting from use of this app.</p>
+    <p>This app depends on the GitHub and Onshape APIs, which are outside
+      the author's control — their availability, rate limits, or behavior
+      may change at any time.</p>
+    <p>Full terms: <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload/blob/main/TERMS.md" target="_blank" rel="noopener" style="color:inherit;">TERMS.md</a></p>
+    <button id="tosAcceptBtn">Got it</button>
   </div>
 </div>
 <div id="dragHint"></div>
@@ -188,7 +215,7 @@
   <div id="status"></div>
 
   <div id="appFooter" style="margin-top:10px; padding-top:8px; border-top:1px solid #3a3b3e; font-size:10px; opacity:0.5; text-align:center;">
-    Created by WanChengJunWang · <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload" target="_blank" rel="noopener" style="color:inherit;">Source (AGPLv3)</a> · <a href="#" id="privacyReopenLink" style="color:inherit;">Privacy</a>
+    Created by WanChengJunWang · <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload" target="_blank" rel="noopener" style="color:inherit;">Source (AGPLv3)</a> · <a href="https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload" target="_blank" rel="noopener" style="color:inherit;">GitHub</a> · <a href="#" id="privacyReopenLink" style="color:inherit;">Privacy</a> · <a href="#" id="tosReopenLink" style="color:inherit;">Terms</a>
   </div>
 </div>
 

@@ -6,6 +6,7 @@ archive-or-delete for replaced files, merging multiple parts into one file,
 per-user OAuth on both sides, and a choice of export format.
 
 Created by WanChengJunWang · [source repo](https://github.com/3rr0r404w4sn0tf0und-sys/Github-Onshape-Upload) · licensed under [AGPLv3](./LICENSE)
+<img width="1910" height="993" alt="image" src="https://github.com/user-attachments/assets/494d325c-82f1-4481-b772-2029599f5fd0" />
 
 ## What it does
 

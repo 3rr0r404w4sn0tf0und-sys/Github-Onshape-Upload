@@ -155,8 +155,19 @@ never writes to, deletes, or modifies anything in Onshape.
 No email address is collected. Nothing is sold or shared with third
 parties. Tokens are only ever used to carry out actions initiated in the
 panel (staging/uploading) — see [`server.js`](./server.js) for exactly
-where each token is used. The same notice is shown in-app on first use,
-and re-openable anytime via the "Privacy" link in the panel's footer.
+where each token is used. The full policy also lives in its own file:
+[`PRIVACY.md`](./PRIVACY.md). The same notice is shown in-app on first
+use, and re-openable anytime via the "Privacy" link in the panel's
+footer.
+
+## Terms of Service
+
+This app is provided as-is with no warranty, and you're responsible for
+reviewing staged changes before committing — it can create, rename,
+overwrite, archive, and delete files in whatever repo you select. Full
+terms: [`TERMS.md`](./TERMS.md). Shown in-app right after the privacy
+notice on first use, and re-openable anytime via the "Terms" link in the
+panel's footer.
 
 ## License
 

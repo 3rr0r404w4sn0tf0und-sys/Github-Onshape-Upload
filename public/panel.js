@@ -17,42 +17,22 @@ const ctx = {
   server: params.get("server"), // origin Onshape posts messages from - required to send/receive Client Messaging postMessages
 };
 
-// ---------- privacy notice + terms of service ----------
-// Both shown once (until dismissed) on first load - privacy first, then
-// terms right after - and each is re-openable anytime via its own footer
-// link. Purely local "have they seen it" flags - not sent anywhere, just
-// gate whether each overlay auto-shows on load.
+// ---------- privacy notice ----------
+// Shown once (until dismissed) on first load, and re-openable anytime via
+// the footer link. Purely a local "have they seen it" flag - not sent
+// anywhere, just gates whether the overlay auto-shows on load.
 const PRIVACY_ACK_KEY = "onshape-github-privacy-ack";
-const TOS_ACK_KEY = "onshape-github-tos-ack";
 const privacyOverlay = document.getElementById("privacyOverlay");
-const tosOverlay = document.getElementById("tosOverlay");
-
 document.getElementById("privacyAcceptBtn")?.addEventListener("click", () => {
   localStorage.setItem(PRIVACY_ACK_KEY, "1");
   privacyOverlay.classList.remove("visible");
-  // Chain straight into terms if they haven't seen those yet either.
-  if (!localStorage.getItem(TOS_ACK_KEY)) {
-    tosOverlay.classList.add("visible");
-  }
 });
 document.getElementById("privacyReopenLink")?.addEventListener("click", (e) => {
   e.preventDefault();
   privacyOverlay.classList.add("visible");
 });
-
-document.getElementById("tosAcceptBtn")?.addEventListener("click", () => {
-  localStorage.setItem(TOS_ACK_KEY, "1");
-  tosOverlay.classList.remove("visible");
-});
-document.getElementById("tosReopenLink")?.addEventListener("click", (e) => {
-  e.preventDefault();
-  tosOverlay.classList.add("visible");
-});
-
 if (!localStorage.getItem(PRIVACY_ACK_KEY)) {
   privacyOverlay.classList.add("visible");
-} else if (!localStorage.getItem(TOS_ACK_KEY)) {
-  tosOverlay.classList.add("visible");
 }
 
 const loginView = document.getElementById("loginView");
@@ -228,6 +208,19 @@ const stagePane = document.getElementById("stagePane");
 const staticCheck = document.getElementById("staticCheck");
 const deleteInsteadCheck = document.getElementById("deleteInsteadCheck");
 const formatSelect = document.getElementById("formatSelect");
+const commitPrefixInput = document.getElementById("commitPrefixInput");
+const commitDescriptionInput = document.getElementById("commitDescriptionInput");
+
+// Commit prefix/description are text the user typed, not a quick toggle -
+// worth remembering across sessions so it's not retyped every upload.
+// Everything else in this settings pane resets each load (existing
+// behavior, unchanged here).
+const COMMIT_PREFIX_KEY = "onshape-github-commit-prefix";
+const COMMIT_DESCRIPTION_KEY = "onshape-github-commit-description";
+commitPrefixInput.value = localStorage.getItem(COMMIT_PREFIX_KEY) || "";
+commitDescriptionInput.value = localStorage.getItem(COMMIT_DESCRIPTION_KEY) || "";
+commitPrefixInput.addEventListener("input", () => localStorage.setItem(COMMIT_PREFIX_KEY, commitPrefixInput.value));
+commitDescriptionInput.addEventListener("input", () => localStorage.setItem(COMMIT_DESCRIPTION_KEY, commitDescriptionInput.value));
 let partsById = {}; // partId -> part info (name, partId) from the current Part Studio
 let allPartsList = []; // full unfiltered list from /api/parts, used by the search filter
 const partSearch = document.getElementById("partSearch");
@@ -1049,18 +1042,40 @@ uploadBtn.addEventListener("click", async () => {
         renames: renamesArr,
         items,
         context: ctx, // documentId/workspaceOrVersion/workspaceOrVersionId/elementId of the Part Studio this panel is open on - every export comes from here
+        commitPrefix: commitPrefixInput.value,
+        commitDescription: commitDescriptionInput.value,
       }),
     });
     const data = await res.json();
+    // A 500 here now only means something failed before any per-step work
+    // started (bad request, missing context, etc.) - individual step
+    // failures come back as ok:false entries inside data.results instead of
+    // throwing, so a partial commit still reaches this branch normally.
     if (!res.ok) throw new Error(data.detail ? `${data.error || "Commit failed"} — ${data.detail}` : (data.error || "Commit failed"));
-    setStatus("Done:\n" + data.results.map((r) => `${r.path} — ${r.action}`).join("\n"));
-    staged = [];
-    pendingDeletes = [];
-    pendingFolderDeletes = [];
-    pendingFolderCreates = [];
-    pendingRenames = {};
-    history = []; historyIndex = -1;
-    renderStage();
+
+    const lines = data.results.map((r) => {
+      if (r.ok === false) return `✕ ${r.path} — ${r.action} FAILED: ${r.error}`;
+      if (r.warning) return `⚠ ${r.path} — ${r.action} (${r.warning})`;
+      return `✓ ${r.path} — ${r.action}`;
+    });
+    const header = data.partial
+      ? "Some steps failed — review before assuming this fully landed:"
+      : (data.success ? "Done:" : "All steps failed:");
+    setStatus(header + "\n" + lines.join("\n"));
+
+    // Only clear staged/pending state for what actually succeeded, so a
+    // partial failure doesn't wipe out staged items that never landed -
+    // otherwise you'd have to redo everything from scratch just because one
+    // item in the batch failed.
+    if (data.success) {
+      staged = [];
+      pendingDeletes = [];
+      pendingFolderDeletes = [];
+      pendingFolderCreates = [];
+      pendingRenames = {};
+      history = []; historyIndex = -1;
+      renderStage();
+    }
     await loadTree();
   } catch (err) {
     setStatus("Error: " + err.message);

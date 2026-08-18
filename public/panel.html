@@ -209,6 +209,12 @@
       <option value="IGES">IGES</option>
       <option value="SOLIDWORKS">SolidWorks</option>
     </select>
+
+    <label style="font-size:10px; opacity:0.6; margin-top:8px; display:block;">Commit prefix <span style="opacity:0.7;">(replaces "feat:"/"chore:" on every message this upload makes - leave blank for default)</span></label>
+    <input type="text" id="commitPrefixInput" placeholder="feat:" style="width:100%; margin:3px 0; padding:4px 6px; background:#1e1f22; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px; box-sizing:border-box;">
+
+    <label style="font-size:10px; opacity:0.6; margin-top:6px; display:block;">Commit description <span style="opacity:0.7;">(optional extended body shown under the summary line on GitHub - {filename} is replaced per file)</span></label>
+    <textarea id="commitDescriptionInput" rows="2" placeholder="e.g. Synced from Onshape Part Studio via panel app." style="width:100%; margin:3px 0; padding:4px 6px; background:#1e1f22; color:#eee; border:1px solid #444; border-radius:3px; font-size:11px; box-sizing:border-box; resize:vertical; font-family:inherit;"></textarea>
   </div>
 
   <button id="uploadBtn">Upload to GitHub</button>

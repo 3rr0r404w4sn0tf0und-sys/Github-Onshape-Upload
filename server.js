@@ -20,6 +20,7 @@ const { Pool } = require("pg");
 const { Octokit } = require("@octokit/rest");
 const axios = require("axios");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -74,11 +75,59 @@ app.use(session({
   },
 }));
 
+// ---------- rate limiting ----------
+// Basic ceilings so a runaway script (or scraper) can't hammer the OAuth
+// flow or rack up GitHub/Onshape API + DB load on your behalf. Limits are
+// generous for genuine interactive use and only bite under sustained
+// automated traffic - loosen these if real usage ever legitimately bumps
+// into them.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many sign-in attempts. Please wait a few minutes and try again." },
+});
+const commitLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Keyed by session (not just IP) where available, so one heavy user
+  // doesn't get lumped in with everyone else behind the same NAT/office IP.
+  keyGenerator: (req) => req.session?.id || req.ip,
+  message: { error: "Too many commits in a short window. Please slow down a bit." },
+});
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.session?.id || req.ip,
+  message: { error: "Too many requests. Please slow down a bit." },
+});
+
+app.use(["/auth/github", "/auth/onshape"], authLimiter);
+app.use("/api/commit", commitLimiter);
+app.use("/api", apiLimiter);
+
 const APP_URL = process.env.APP_URL; // e.g. https://onshape-github-panel.onrender.com
 const GH_CLIENT_ID = process.env.GITHUB_OAUTH_CLIENT_ID;
 const GH_CLIENT_SECRET = process.env.GITHUB_OAUTH_CLIENT_SECRET;
 const OS_CLIENT_ID = process.env.ONSHAPE_OAUTH_CLIENT_ID;
 const OS_CLIENT_SECRET = process.env.ONSHAPE_OAUTH_CLIENT_SECRET;
+
+// Rejects any repo path containing a ".." segment or a leading "/" before
+// it's ever handed to GitHub's API. Nothing in the current UI generates a
+// path like that, but every path here originates from the client (JSON the
+// browser sent), and the browser is never trustworthy input for a web app -
+// this is a backstop against a malformed/tampered request or a future bug
+// upstream that builds a bad path, not a response to any specific incident.
+function isSafeRepoPath(p) {
+  if (typeof p !== "string" || !p.length) return false;
+  if (p.startsWith("/")) return false;
+  return !p.split("/").some((seg) => seg === ".." || seg === ".");
+}
 
 function requireAuth(req, res, next) {
   if (!req.session.accessToken) return res.status(401).json({ error: "Not signed in to GitHub" });
@@ -145,12 +194,25 @@ async function onshapeRequest(req, requestFn) {
 // ---------- GitHub OAuth flow ----------
 
 app.get("/auth/github", (req, res) => {
-  const url = `https://github.com/login/oauth/authorize?client_id=${GH_CLIENT_ID}&redirect_uri=${encodeURIComponent(APP_URL + "/auth/github/callback")}&scope=repo`;
+  // CSRF guard: a random, single-use value tied to THIS session, checked
+  // against whatever the callback comes back with. Without it, an attacker
+  // could craft their own /auth/github/callback?code=... link using a code
+  // from an OAuth flow they control and get a victim's browser to complete
+  // it in the victim's session (session fixation) - the state round-trip is
+  // what proves the callback actually belongs to a flow this app started.
+  const state = require("crypto").randomBytes(16).toString("hex");
+  req.session.githubOauthState = state;
+  const url = `https://github.com/login/oauth/authorize?client_id=${GH_CLIENT_ID}&redirect_uri=${encodeURIComponent(APP_URL + "/auth/github/callback")}&scope=repo&state=${state}`;
   res.redirect(url);
 });
 
 app.get("/auth/github/callback", async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
+  const expectedState = req.session.githubOauthState;
+  delete req.session.githubOauthState; // single-use
+  if (!state || !expectedState || state !== expectedState) {
+    return res.status(400).send("GitHub OAuth failed: invalid or missing state parameter (possible CSRF attempt). Please try signing in again.");
+  }
   try {
     const tokenRes = await axios.post(
       "https://github.com/login/oauth/access_token",
@@ -180,12 +242,20 @@ app.get("/auth/github/callback", async (req, res) => {
 // about whether Onshape's own authorize page allows being framed.
 
 app.get("/auth/onshape", (req, res) => {
-  const url = `https://oauth.onshape.com/oauth/authorize?response_type=code&client_id=${OS_CLIENT_ID}&redirect_uri=${encodeURIComponent(APP_URL + "/auth/onshape/callback")}`;
+  // Same CSRF guard as the GitHub flow - see comment there for why.
+  const state = require("crypto").randomBytes(16).toString("hex");
+  req.session.onshapeOauthState = state;
+  const url = `https://oauth.onshape.com/oauth/authorize?response_type=code&client_id=${OS_CLIENT_ID}&redirect_uri=${encodeURIComponent(APP_URL + "/auth/onshape/callback")}&state=${state}`;
   res.redirect(url);
 });
 
 app.get("/auth/onshape/callback", async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
+  const expectedState = req.session.onshapeOauthState;
+  delete req.session.onshapeOauthState; // single-use
+  if (!state || !expectedState || state !== expectedState) {
+    return res.status(400).send("Onshape OAuth failed: invalid or missing state parameter (possible CSRF attempt). Please try signing in again.");
+  }
   try {
     const tokenRes = await axios.post(
       "https://oauth.onshape.com/oauth/token",
@@ -468,7 +538,10 @@ async function getRepoTree(req) {
   return treeData.tree;
 }
 
-async function applyRename(req, oldPath, newPath, isFolder) {
+// msgFn optionally transforms each default commit message (applies custom
+// prefix/description from the panel's settings, if the caller supplied
+// one) - defaults to identity so callers that don't care are unaffected.
+async function applyRename(req, oldPath, newPath, isFolder, msgFn = (m) => m) {
   if (isFolder) {
     const tree = await getRepoTree(req);
     const affected = tree.filter((e) => e.type === "blob" && (e.path === oldPath || e.path.startsWith(oldPath + "/")));
@@ -477,22 +550,22 @@ async function applyRename(req, oldPath, newPath, isFolder) {
       if (!file) continue;
       const relative = entry.path.substring(oldPath.length); // e.g. "/Sub/file.step", or "" if this IS the renamed path itself
       const newFullPath = newPath ? `${newPath}${relative}` : relative.replace(/^\//, "");
-      await putFile(req, newFullPath, Buffer.from(file.content, "base64"), `chore: move ${entry.path} -> ${newFullPath}`);
-      await deleteFile(req, entry.path, `chore: remove old path after folder move`, file.sha);
+      await putFile(req, newFullPath, Buffer.from(file.content, "base64"), msgFn(`chore: move ${entry.path} -> ${newFullPath}`));
+      await deleteFile(req, entry.path, msgFn(`chore: remove old path after folder move`), file.sha);
     }
   } else {
     const file = await getFile(req, oldPath);
     if (!file) return;
-    await putFile(req, newPath, Buffer.from(file.content, "base64"), `chore: rename ${oldPath} -> ${newPath}`);
-    await deleteFile(req, oldPath, `chore: remove old path after rename`, file.sha);
+    await putFile(req, newPath, Buffer.from(file.content, "base64"), msgFn(`chore: rename ${oldPath} -> ${newPath}`));
+    await deleteFile(req, oldPath, msgFn(`chore: remove old path after rename`), file.sha);
   }
 }
 
-async function applyFolderDelete(req, folderPath) {
+async function applyFolderDelete(req, folderPath, msgFn = (m) => m) {
   const tree = await getRepoTree(req);
   const affected = tree.filter((e) => e.type === "blob" && (e.path === folderPath || e.path.startsWith(folderPath + "/")));
   for (const entry of affected) {
-    await deleteFile(req, entry.path, `chore: delete folder ${folderPath}`, entry.sha);
+    await deleteFile(req, entry.path, msgFn(`chore: delete folder ${folderPath}`), entry.sha);
   }
 }
 
@@ -558,31 +631,127 @@ app.post("/api/commit", requireAuth, async (req, res) => {
   // elementId) is that Part Studio, sent by the panel alongside the items.
   const { context = null } = req.body;
 
+  // Optional per-commit customization from the panel's settings pane:
+  // - commitPrefix swaps the leading "feat:"/"chore:" on every
+  //   auto-generated summary line (deletes, archives, folder creates, the
+  //   upload message, etc.) for something else, e.g. "onshape-sync:".
+  // - commitMessageTemplate fully replaces the summary line for staged
+  //   items specifically (the "feat: upload X from Onshape" one), with a
+  //   {filename} placeholder. Falls back to the default when blank.
+  // - commitDescription is an extended body appended under the summary
+  //   line on EVERY commit this batch makes (GitHub shows summary bold,
+  //   description below it) - e.g. a standing note like "Synced from
+  //   Onshape Part Studio via panel app." Supports {filename}.
+  const { commitPrefix = "", commitMessageTemplate = "", commitDescription = "" } = req.body;
+  const trimmedPrefix = typeof commitPrefix === "string" ? commitPrefix.trim() : "";
+  const trimmedTemplate = typeof commitMessageTemplate === "string" ? commitMessageTemplate.trim() : "";
+  const trimmedDescription = typeof commitDescription === "string" ? commitDescription.trim() : "";
+  // Applies the custom prefix (if any) to a default "feat: ..."/"chore: ..."
+  // message by swapping just the leading word before the colon - leaves the
+  // rest of the message (which describes what actually happened) untouched.
+  function withPrefix(defaultMessage) {
+    if (!trimmedPrefix) return defaultMessage;
+    const colonIdx = defaultMessage.indexOf(":");
+    return colonIdx === -1 ? defaultMessage : `${trimmedPrefix}${defaultMessage.slice(colonIdx)}`;
+  }
+  // Appends the extended description (if any) below the summary line, git's
+  // usual convention: summary, blank line, then the body. {filename} is
+  // substituted in if the caller passed one along.
+  function withDescription(summaryLine, filename) {
+    if (!trimmedDescription) return summaryLine;
+    const body = filename ? trimmedDescription.replace(/\{filename\}/g, filename) : trimmedDescription;
+    return `${summaryLine}\n\n${body}`;
+  }
+  function commitMessage(defaultSummary, filename) {
+    const summary = withPrefix(defaultSummary);
+    return withDescription(summary, filename);
+  }
+  function uploadMessage(filename) {
+    const summary = trimmedTemplate ? trimmedTemplate.replace(/\{filename\}/g, filename) : withPrefix(`feat: upload ${filename} from Onshape`);
+    return withDescription(summary, filename);
+  }
+
   try {
     if (items.length && (!context || !context.documentId)) {
       return res.status(400).json({ error: "Missing Part Studio context - try reopening the panel from its tab." });
     }
 
+    // Validate every path in the batch BEFORE any writes happen, so a bad
+    // path fails the whole request cleanly instead of partway through.
+    const allPaths = [
+      ...deletes,
+      ...folderDeletes,
+      ...folderCreates,
+      ...renames.flatMap((r) => [r.oldPath, r.newPath]),
+      ...items.flatMap((it) => [it.destinationPath, it.replaceTarget, ...(it.replaceTargets || [])].filter(Boolean)),
+    ];
+    const badPath = allPaths.find((p) => !isSafeRepoPath(p));
+    if (badPath !== undefined) {
+      return res.status(400).json({ error: `Invalid path: "${badPath}"` });
+    }
+
     const results = [];
+
+    // Turns any thrown error into a readable {reason} string instead of a
+    // raw axios/error object - used by every per-item catch block below so
+    // one bad step reports clearly instead of dumping a stack trace shape.
+    function describeError(err) {
+      if (err.isKnownLimitation) return err.message;
+      const failedUrl = err.config ? `${(err.config.method || "?").toUpperCase()} ${err.config.url}` : null;
+      let upstreamBody = null;
+      if (err.response?.data) {
+        // axios can hand back the error body as a raw Buffer (e.g. when the
+        // request was made with responseType: "arraybuffer", as our file
+        // download calls are) - decode it to text instead of dumping a
+        // byte-array wall of numbers into the error message.
+        const raw = Buffer.isBuffer(err.response.data) ? err.response.data.toString("utf8") : JSON.stringify(err.response.data);
+        upstreamBody = raw.slice(0, 300);
+      }
+      console.error(failedUrl, err.response?.status, upstreamBody || err.message);
+      return failedUrl
+        ? `${failedUrl} → ${err.response?.status}${upstreamBody ? " " + upstreamBody : ""}`
+        : err.message;
+    }
+
+    // Every step below is wrapped individually instead of letting one
+    // failure throw out of the whole handler. That way a batch of, say, 10
+    // staged items where #4 fails still commits 1-3 and 5-10, and the
+    // response tells you exactly which ones landed vs. which didn't -
+    // instead of an all-or-nothing 500 that leaves you guessing what
+    // actually happened to your repo. Each pushed result carries
+    // `ok: true/false` plus `error` on failure.
 
     // Renames/moves and folder deletes queued while the user was working in
     // the tree get applied first, so everything downstream (deletes, archive
     // lookups, replace targets) sees the tree in its final shape.
     for (const r of renames) {
-      await applyRename(req, r.oldPath, r.newPath, r.isFolder);
-      results.push({ path: `${r.oldPath} → ${r.newPath}`, action: r.isFolder ? "folder moved" : "renamed" });
+      const path = `${r.oldPath} → ${r.newPath}`;
+      try {
+        await applyRename(req, r.oldPath, r.newPath, r.isFolder, commitMessage);
+        results.push({ path, action: r.isFolder ? "folder moved" : "renamed", ok: true });
+      } catch (err) {
+        results.push({ path, action: r.isFolder ? "folder moved" : "renamed", ok: false, error: describeError(err) });
+      }
     }
 
     for (const folderPath of folderDeletes) {
-      await applyFolderDelete(req, folderPath);
-      results.push({ path: folderPath, action: "folder deleted" });
+      try {
+        await applyFolderDelete(req, folderPath, commitMessage);
+        results.push({ path: folderPath, action: "folder deleted", ok: true });
+      } catch (err) {
+        results.push({ path: folderPath, action: "folder deleted", ok: false, error: describeError(err) });
+      }
     }
 
     for (const targetPath of deletes) {
-      const existing = await getFile(req, targetPath);
-      if (existing) {
-        await deleteFile(req, targetPath, `chore: delete ${targetPath}`, existing.sha);
-        results.push({ path: targetPath, action: "deleted" });
+      try {
+        const existing = await getFile(req, targetPath);
+        if (existing) {
+          await deleteFile(req, targetPath, commitMessage(`chore: delete ${targetPath}`), existing.sha);
+          results.push({ path: targetPath, action: "deleted", ok: true });
+        }
+      } catch (err) {
+        results.push({ path: targetPath, action: "deleted", ok: false, error: describeError(err) });
       }
     }
 
@@ -593,8 +762,12 @@ app.post("/api/commit", requireAuth, async (req, res) => {
     const destinationsThisCommit = new Set(items.map((it) => it.destinationPath).filter(Boolean));
     for (const folderPath of folderCreates) {
       if (destinationsThisCommit.has(folderPath)) continue;
-      await putFile(req, `${folderPath}/.gitkeep`, Buffer.from(""), `feat: create folder ${folderPath}`);
-      results.push({ path: folderPath, action: "folder created" });
+      try {
+        await putFile(req, `${folderPath}/.gitkeep`, Buffer.from(""), commitMessage(`feat: create folder ${folderPath}`));
+        results.push({ path: folderPath, action: "folder created", ok: true });
+      } catch (err) {
+        results.push({ path: folderPath, action: "folder created", ok: false, error: describeError(err) });
+      }
     }
 
     for (const item of items) {
@@ -623,68 +796,84 @@ app.post("/api/commit", requireAuth, async (req, res) => {
         ? (replaceFolder ? `${replaceFolder}/${filename}` : filename)
         : (item.destinationPath ? `${item.destinationPath}/${filename}` : filename);
 
-      const buffer = await exportPartsAsStep(
-        req,
-        context.documentId,
-        context.workspaceOrVersion,
-        context.workspaceOrVersionId,
-        context.elementId,
-        item.parts.map((p) => p.partId),
-        item.isStatic && item.parts.length > 1,
-        formatName,
-      );
+      try {
+        const buffer = await exportPartsAsStep(
+          req,
+          context.documentId,
+          context.workspaceOrVersion,
+          context.workspaceOrVersionId,
+          context.elementId,
+          item.parts.map((p) => p.partId),
+          item.isStatic && item.parts.length > 1,
+          formatName,
+        );
 
-      // Archive/delete every OLD file this export is replacing, each at its
-      // own original path/name - never targetPath, which by this point is
-      // the NEW (possibly renamed) path. A static merge with several staged
-      // parts, each with their own replaceTarget, needs ALL of them cleaned
-      // up here, not just the first.
-      let anyReplaced = false;
-      for (const oldPath of replaceTargets) {
-        const existing = await getFile(req, oldPath);
-        if (!existing) continue;
-        anyReplaced = true;
-        const oldFilename = oldPath.includes("/") ? oldPath.substring(oldPath.lastIndexOf("/") + 1) : oldPath;
-        if (item.archiveMode === "delete") {
-          await deleteFile(req, oldPath, `chore: delete ${oldFilename} (replaced)`, existing.sha);
-        } else {
-          const folder = oldPath.includes("/") ? oldPath.substring(0, oldPath.lastIndexOf("/")) : "";
-          // Look for whatever "archive" folder already exists in this folder
-          // (any casing) rather than always assuming one named exactly "Archive".
-          const archiveFolderName = await findArchiveFolderName(req, folder);
-          const archivePath = folder ? `${folder}/${archiveFolderName}/${oldFilename}` : `${archiveFolderName}/${oldFilename}`;
-          await putFile(req, archivePath, Buffer.from(existing.content, "base64"), `chore: archive previous ${oldFilename}`);
-          await deleteFile(req, oldPath, `chore: remove old ${oldFilename} (archived)`, existing.sha);
+        // Write the NEW file first, before touching any old file this is
+        // replacing. If this item fails anywhere above this line, nothing
+        // about the old file has been touched yet - it's still safely
+        // sitting in the repo, so a failed export/write never costs you
+        // the file it was supposed to replace. Old-file cleanup only runs
+        // once the new file is confirmed written.
+        await putFile(req, targetPath, buffer, uploadMessage(filename));
+
+        // Archive/delete every OLD file this export is replacing, each at its
+        // own original path/name - never targetPath, which by this point is
+        // the NEW (possibly renamed) path. A static merge with several staged
+        // parts, each with their own replaceTarget, needs ALL of them cleaned
+        // up here, not just the first. Each old file's cleanup is its own
+        // try/catch so one failing (e.g. already gone) doesn't stop the
+        // others, and doesn't retroactively "fail" the new file that's
+        // already safely committed above.
+        let anyReplaced = false;
+        const cleanupErrors = [];
+        for (const oldPath of replaceTargets) {
+          try {
+            const existing = await getFile(req, oldPath);
+            if (!existing) continue;
+            anyReplaced = true;
+            const oldFilename = oldPath.includes("/") ? oldPath.substring(oldPath.lastIndexOf("/") + 1) : oldPath;
+            if (item.archiveMode === "delete") {
+              await deleteFile(req, oldPath, commitMessage(`chore: delete ${oldFilename} (replaced)`), existing.sha);
+            } else {
+              const folder = oldPath.includes("/") ? oldPath.substring(0, oldPath.lastIndexOf("/")) : "";
+              // Look for whatever "archive" folder already exists in this folder
+              // (any casing) rather than always assuming one named exactly "Archive".
+              const archiveFolderName = await findArchiveFolderName(req, folder);
+              const archivePath = folder ? `${folder}/${archiveFolderName}/${oldFilename}` : `${archiveFolderName}/${oldFilename}`;
+              await putFile(req, archivePath, Buffer.from(existing.content, "base64"), commitMessage(`chore: archive previous ${oldFilename}`));
+              await deleteFile(req, oldPath, commitMessage(`chore: remove old ${oldFilename} (archived)`), existing.sha);
+            }
+          } catch (err) {
+            cleanupErrors.push(`${oldPath}: ${describeError(err)}`);
+          }
         }
+
+        const action = anyReplaced ? (item.archiveMode === "delete" ? "replaced-deleted" : "replaced-archived") : "added";
+        if (cleanupErrors.length) {
+          // New file is up either way - flag this as a partial success so
+          // it's visible that some old file(s) weren't cleaned up, rather
+          // than silently reporting full success.
+          results.push({ path: targetPath, action, ok: true, warning: `New file uploaded, but cleanup of old file(s) failed: ${cleanupErrors.join("; ")}` });
+        } else {
+          results.push({ path: targetPath, action, ok: true });
+        }
+      } catch (err) {
+        results.push({ path: targetPath, action: "add/replace", ok: false, error: describeError(err) });
       }
-
-      await putFile(req, targetPath, buffer, `feat: upload ${filename} from Onshape`);
-      results.push({ path: targetPath, action: anyReplaced ? (item.archiveMode === "delete" ? "replaced-deleted" : "replaced-archived") : "added" });
     }
 
-    res.json({ success: true, results });
-  } catch (err) {
-    if (err.isKnownLimitation) {
-      console.error(err.message);
-      return res.status(400).json({ error: err.message });
-    }
-    const failedUrl = err.config ? `${(err.config.method || "?").toUpperCase()} ${err.config.url}` : null;
-    let upstreamBody = null;
-    if (err.response?.data) {
-      // axios can hand back the error body as a raw Buffer (e.g. when the
-      // request was made with responseType: "arraybuffer", as our file
-      // download calls are) - decode it to text instead of dumping a
-      // byte-array wall of numbers into the error message.
-      const raw = Buffer.isBuffer(err.response.data) ? err.response.data.toString("utf8") : JSON.stringify(err.response.data);
-      upstreamBody = raw.slice(0, 300);
-    }
-    console.error(failedUrl, err.response?.status, upstreamBody || err.message);
-    res.status(500).json({
-      error: "Commit failed",
-      detail: failedUrl
-        ? `${failedUrl} → ${err.response?.status}${upstreamBody ? " " + upstreamBody : ""}`
-        : err.message,
+    const failures = results.filter((r) => !r.ok);
+    res.json({
+      success: failures.length === 0,
+      partial: failures.length > 0 && failures.length < results.length,
+      results,
     });
+  } catch (err) {
+    // Only truly unexpected/setup-level errors (bad request body, missing
+    // context, etc.) still reach here - per-step failures are caught above
+    // and reported in `results` instead of aborting the whole commit.
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ error: "Commit failed", detail: err.message });
   }
 });
 
